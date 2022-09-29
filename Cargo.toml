@@ -18,3 +18,6 @@ tracing = { version = "0.1.29", features = ["log"] }
 tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
 futures = "0.3.24"
 tokio-stream = "0.1.10"
+eth2_ssz = "0.4.0"
+eth2_ssz_derive = "0.3.0"
+warp = "0.3"

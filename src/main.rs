@@ -3,10 +3,18 @@ use discv5::{
     enr::{CombinedKey, NodeId, Enr},
     Discv5, Discv5Config, Discv5Event,
 };
+use warp::Filter;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::time;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt, StreamMap};
 use tracing::{info, log::warn};
+use std::sync::Arc;
+
+mod types;
+enum Topology {
+    Linear,
+}
+
 #[tokio::main]
 async fn main() {
     // allows detailed logging with the RUST_LOG env variable
@@ -38,11 +46,14 @@ async fn main() {
             10
         }
     };
+    
     let discv5_servers = construct_and_start(address, port, node_count).await;
-    let enrs = discv5_servers
+
+    let enrs = Arc::new(discv5_servers
         .iter()
         .map(|s| s.local_enr())
-        .collect::<Vec<_>>();
+        .collect::<Vec<_>>());
+    
     let mut str = StreamMap::new();
     for (i, s) in discv5_servers.iter().enumerate() {
         let rec = ReceiverStream::new(s.event_stream().await.unwrap());
@@ -68,13 +79,19 @@ async fn main() {
                     Discv5Event::SocketUpdated(addr) => {
                         info!("Stream {}: Socket updated {}", chan, addr)
                     }
-                    Discv5Event::TalkRequest(_) => info!("Stream {}: Talk request received", chan),
+                    Discv5Event::TalkRequest(req) => {
+                        let req_msg =String::from_utf8(req.body().to_vec()).unwrap() ;
+                        info!("Stream {}: Talk request received: {}", chan, req_msg);
+                        let response = format!("Response: {}", req_msg);
+                        req.respond(response.into_bytes()).unwrap();
+                    }
                 }
             }
         }
     });
-
+    let enrs_stats = enrs.clone();
     let stats_task = tokio::spawn(async move {
+        let enrs = enrs_stats;
         loop {
             let peer_count = discv5_servers
                 .iter()
@@ -85,22 +102,32 @@ async fn main() {
                 .map(|s| s.metrics())
                 .collect::<Vec<_>>();
             println!("Peer Count: {:?}", peer_count);
-            println!("Metrics: {:?}", met);
+            // println!("Metrics: {:?}", met);
 
+            let num_servers = discv5_servers.len();
             for (i, discv5) in discv5_servers.iter().enumerate() {
-                if i != 2 {
-                    let nextnode = enrs[(i+1)%3].clone().udp4().unwrap();
+                let nextnode = enrs[(i+1)%num_servers].clone().udp4().unwrap();
+                if i != num_servers - 1 {
                     let predicate = Box::new(move |enr: &Enr<CombinedKey>| enr.udp4().unwrap() == nextnode.clone());
     
-                    let found_nodes = discv5.find_node_predicate(enrs[(i+1)%3].node_id(), predicate, 1).await.unwrap();
+                    let found_nodes = discv5.find_node_predicate(enrs[(i+1)%num_servers].node_id(), predicate, 1).await.unwrap();
                     println!("Found nodes: {:?}", found_nodes);
                 }
-
             }
-            time::sleep(time::Duration::from_secs(1)).await;
+
+            // send talkreq from first node to last node
+            let resp = discv5_servers[0].talk_req(enrs[enrs.len()-1].clone(), b"123".to_vec(), format!("hello{}",0).into_bytes()).await.unwrap();
+            info!("Got response: {}", String::from_utf8(resp).unwrap());
+            time::sleep(time::Duration::from_secs(5)).await;
         }
     });
 
+    let enr_records = warp::path("enrs").map(move || {
+        format!("{:?}", &enrs.clone())
+    });
+    warp::serve(enr_records)
+        .run(([127, 0, 0, 1], 3030))
+        .await;
     discv5_events_task.await.unwrap();
     stats_task.await.unwrap();
 }
@@ -150,12 +177,7 @@ async fn construct_and_start(
         let discv5 = Discv5::new(enr, enr_key, config).unwrap();
         discv5_servers.push(discv5);
     }
-    let enrs = discv5_servers
-        .iter()
-        .map(|s| s.local_enr())
-        .collect::<Vec<_>>();
-    discv5_servers[0].add_enr(enrs[1].clone()).unwrap();
-    discv5_servers[1].add_enr(enrs[2].clone()).unwrap();
+    set_topology(&discv5_servers);
     for s in discv5_servers.iter_mut() {
         let ip4 = s.local_enr().ip4().unwrap();
         let udp4 = s.local_enr().udp4().unwrap();
@@ -164,4 +186,25 @@ async fn construct_and_start(
             .unwrap();
     }
     discv5_servers
+}
+
+pub fn set_topology(discv5_servers: &[Discv5]) {
+    let enrs = discv5_servers.iter().map(|s|s.local_enr()).collect::<Vec<_>>();
+    let topology = if let Some(topo) = std::env::args().nth(4) {
+        match topo.as_str() {
+            "linear" => Topology::Linear,
+            _ => Topology::Linear
+        }
+    } else {
+        Topology::Linear
+    };
+    match topology {
+        Topology::Linear => {
+            for (i, s) in discv5_servers.iter().enumerate() {
+                if i != discv5_servers.len() - 1 {
+                    s.add_enr(enrs[i+1].clone()).unwrap()
+                }
+            }
+        },
+    }
 }
