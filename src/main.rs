@@ -7,53 +7,60 @@ use warp::Filter;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::time;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt, StreamMap};
-use tracing::{info, log::warn};
+use tracing::{info, log::warn, info_span, trace_span, Instrument};
 use std::sync::Arc;
+use std::thread::sleep;
+use std::time::Duration;
+use tracing_subscriber::fmt::format::FmtSpan;
+use cli_batteries::{version,};
+use clap::Parser;
 
 mod types;
+
 enum Topology {
     Linear,
 }
 
-#[tokio::main]
-async fn main() {
+#[derive(Parser)]
+pub struct Options {
+    #[clap(long, short, default_value = "0.0.0.0")]
+    ip_listen: String,
+    #[clap(long, short, default_value = "9000")]
+    port_udp: usize,
+    #[clap(long, short, default_value = "10")]
+    node_count: usize,
+    #[clap(long, short, default_value = "linear")]
+    topology: String,
+    #[clap(long, short, default_value = "1")]
+    simulation_case: usize,
+}
+
+fn main() {
+    cli_batteries::run(version!(), app);
+}
+
+async fn app(options: Options) -> eyre::Result<()> {
     // allows detailed logging with the RUST_LOG env variable
     let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
         .unwrap();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter_layer)
+        .with_span_events(FmtSpan::CLOSE)
         .try_init();
 
     // if there is an address specified use it
-    let address = std::env::args()
-        .nth(1)
-        .map(|addr| addr.parse::<Ipv4Addr>().unwrap())
-        .unwrap();
 
-    let port = {
-        if let Some(udp_port) = std::env::args().nth(2) {
-            udp_port.parse().unwrap()
-        } else {
-            9000
-        }
+    let discv5_servers = {
+        let address = options.ip_listen.parse::<Ipv4Addr>().unwrap();
+        construct_and_start(&options, address, options.port_udp, options.node_count).await
     };
-
-    let node_count = {
-        if let Some(node_count) = std::env::args().nth(3) {
-            node_count.parse().unwrap()
-        } else {
-            10
-        }
-    };
-    
-    let discv5_servers = construct_and_start(address, port, node_count).await;
 
     let enrs = Arc::new(discv5_servers
         .iter()
         .map(|s| s.local_enr())
         .collect::<Vec<_>>());
-    
+
     let mut str = StreamMap::new();
     for (i, s) in discv5_servers.iter().enumerate() {
         let rec = ReceiverStream::new(s.event_stream().await.unwrap());
@@ -92,6 +99,7 @@ async fn main() {
     let enrs_stats = enrs.clone();
     let stats_task = tokio::spawn(async move {
         let enrs = enrs_stats;
+
         loop {
             let peer_count = discv5_servers
                 .iter()
@@ -104,20 +112,8 @@ async fn main() {
             println!("Peer Count: {:?}", peer_count);
             // println!("Metrics: {:?}", met);
 
-            let num_servers = discv5_servers.len();
-            for (i, discv5) in discv5_servers.iter().enumerate() {
-                let nextnode = enrs[(i+1)%num_servers].clone().udp4().unwrap();
-                if i != num_servers - 1 {
-                    let predicate = Box::new(move |enr: &Enr<CombinedKey>| enr.udp4().unwrap() == nextnode.clone());
-    
-                    let found_nodes = discv5.find_node_predicate(enrs[(i+1)%num_servers].node_id(), predicate, 1).await.unwrap();
-                    println!("Found nodes: {:?}", found_nodes);
-                }
-            }
+            play_simulation(&options, &discv5_servers, &enrs).await;
 
-            // send talkreq from first node to last node
-            let resp = discv5_servers[0].talk_req(enrs[enrs.len()-1].clone(), b"123".to_vec(), format!("hello{}",0).into_bytes()).await.unwrap();
-            info!("Got response: {}", String::from_utf8(resp).unwrap());
             time::sleep(time::Duration::from_secs(5)).await;
         }
     });
@@ -130,9 +126,36 @@ async fn main() {
         .await;
     discv5_events_task.await.unwrap();
     stats_task.await.unwrap();
+    Ok(())
+}
+
+
+
+enum SimCase {
+    LinearRouting,
+}
+
+pub async fn play_simulation(opts: &Options, discv5_servers: &[Discv5], enrs: &Arc<Vec<Enr<CombinedKey>>>) {
+    let case = match opts.simulation_case {
+        1 => SimCase::LinearRouting,
+        _ => SimCase::LinearRouting
+    };
+
+    match case {
+        SimCase::LinearRouting => {
+            assert!(discv5_servers.len() > 2);
+            let last_node = discv5_servers.last().unwrap();
+            let span = info_span!("routing", last_node_id=last_node.local_enr().node_id().to_string());
+            let _found = discv5_servers[0].find_node(last_node.local_enr().node_id()).instrument(span).await.unwrap();
+            // send talkreq from first node to last node
+            let resp = discv5_servers[0].talk_req(enrs[enrs.len()-1].clone(), b"123".to_vec(), format!("hello{}",0).into_bytes()).await.unwrap();
+            info!("Got response: {}", String::from_utf8(resp).unwrap());
+        }
+    }
 }
 
 async fn construct_and_start(
+    opts: &Options,
     listen_addr: Ipv4Addr,
     port_start: usize,
     node_count: usize,
@@ -177,7 +200,7 @@ async fn construct_and_start(
         let discv5 = Discv5::new(enr, enr_key, config).unwrap();
         discv5_servers.push(discv5);
     }
-    set_topology(&discv5_servers);
+    set_topology(&opts, &discv5_servers);
     for s in discv5_servers.iter_mut() {
         let ip4 = s.local_enr().ip4().unwrap();
         let udp4 = s.local_enr().udp4().unwrap();
@@ -188,15 +211,11 @@ async fn construct_and_start(
     discv5_servers
 }
 
-pub fn set_topology(discv5_servers: &[Discv5]) {
+pub fn set_topology(opts: &Options, discv5_servers: &[Discv5]) {
     let enrs = discv5_servers.iter().map(|s|s.local_enr()).collect::<Vec<_>>();
-    let topology = if let Some(topo) = std::env::args().nth(4) {
-        match topo.as_str() {
-            "linear" => Topology::Linear,
-            _ => Topology::Linear
-        }
-    } else {
-        Topology::Linear
+    let topology = match opts.topology.as_str() {
+        "linear" => Topology::Linear,
+        _ => Topology::Linear
     };
     match topology {
         Topology::Linear => {
