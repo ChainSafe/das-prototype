@@ -15,14 +15,14 @@ hex = "0.4.3"
 parking_lot = "0.11.2"
 tokio-util = { version = "0.6.9", features = ["time"] }
 clap = { version = "3.2", features = [ "derive" ] }
-tracing = { version = "0.1.29", features = ["log", "log-always"] }
-tracing-subscriber = { version = "0.3.3", features = ["env-filter"] }
+tracing = { version = "0.1.29" }
 futures = "0.3.24"
 tokio-stream = "0.1.10"
 eth2_ssz = "0.4.0"
 eth2_ssz_derive = "0.3.0"
 warp = "0.3"
 strum = {version = "0.24", features = ["derive"] }
+itertools = "0.10"
 
 
 cli-batteries = "0.3"
