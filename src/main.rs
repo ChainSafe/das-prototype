@@ -1,8 +1,4 @@
-use discv5::{
-    enr,
-    enr::{CombinedKey, NodeId, Enr},
-    Discv5, Discv5Config, Discv5Event,
-};
+use discv5::{enr, enr::{CombinedKey, NodeId, Enr}, Discv5, Discv5Config, Discv5Event, Key};
 use warp::Filter;
 use std::net::{Ipv4Addr, SocketAddr};
 use tokio::time;
@@ -14,10 +10,16 @@ use std::time::Duration;
 use tracing_subscriber::fmt::format::FmtSpan;
 use cli_batteries::{version,};
 use clap::Parser;
+use discv5::kbucket::Node;
+use enr::k256::elliptic_curve::bigint::Encoding;
+use enr::k256::U256;
+use strum::EnumString;
 
 mod types;
 
+#[derive(Debug, PartialEq, EnumString)]
 enum Topology {
+    #[strum(serialize = "linear", serialize = "1")]
     Linear,
 }
 
@@ -30,9 +32,9 @@ pub struct Options {
     #[clap(long, short, default_value = "10")]
     node_count: usize,
     #[clap(long, short, default_value = "linear")]
-    topology: String,
+    topology: Topology,
     #[clap(long, short, default_value = "1")]
-    simulation_case: usize,
+    simulation_case: SimCase,
 }
 
 fn main() {
@@ -130,26 +132,47 @@ async fn app(options: Options) -> eyre::Result<()> {
 }
 
 
-
+#[derive(Debug, PartialEq, EnumString)]
 enum SimCase {
+    #[strum(serialize = "1")]
     LinearRouting,
+    #[strum(serialize = "2")]
+    ClosestToValue
 }
 
 pub async fn play_simulation(opts: &Options, discv5_servers: &[Discv5], enrs: &Arc<Vec<Enr<CombinedKey>>>) {
-    let case = match opts.simulation_case {
-        1 => SimCase::LinearRouting,
-        _ => SimCase::LinearRouting
-    };
+    assert!(discv5_servers.len() > 2);
+    info!("starting simulation case {:?}", opts.simulation_case);
 
-    match case {
+    match opts.simulation_case {
         SimCase::LinearRouting => {
-            assert!(discv5_servers.len() > 2);
             let last_node = discv5_servers.last().unwrap();
-            let span = info_span!("routing", last_node_id=last_node.local_enr().node_id().to_string());
-            let _found = discv5_servers[0].find_node(last_node.local_enr().node_id()).instrument(span).await.unwrap();
+            let span = info_span!("routing", target_key=last_node.local_enr().node_id().to_string());
+            let found = discv5_servers[0].find_node(last_node.local_enr().node_id()).instrument(span).await.unwrap();
+            info!("found_nodes {}", found.len());
             // send talkreq from first node to last node
             let resp = discv5_servers[0].talk_req(enrs[enrs.len()-1].clone(), b"123".to_vec(), format!("hello{}",0).into_bytes()).await.unwrap();
             info!("Got response: {}", String::from_utf8(resp).unwrap());
+        }
+        SimCase::ClosestToValue => {
+            let last_node_id = discv5_servers.last().unwrap().local_enr().node_id();
+
+            let distant_key = {
+                let hash = U256::from_be_slice(last_node_id.raw().as_ref());
+                let raw = hash ^ U256::ONE;
+                NodeId::new(&raw.to_be_bytes())
+            };
+
+            let d9 = Key::from(last_node_id).distance(&Key::from(distant_key));
+            let d2 = Key::from(discv5_servers[1].local_enr().node_id()).distance(&Key::from(distant_key));
+
+            println!("d2={:?}, d9={:?}, d2 > d9 = {}", d2, d9, d2 > d9);
+            // Key::from(last_node_id).distance(&Key::from(distant_key))
+
+
+            let span = info_span!("routing", target_key=distant_key.to_string());
+            let found = discv5_servers[0].find_node(distant_key).instrument(span).await.unwrap();
+            info!("found_nodes {}", found.len());
         }
     }
 }
@@ -213,15 +236,11 @@ async fn construct_and_start(
 
 pub fn set_topology(opts: &Options, discv5_servers: &[Discv5]) {
     let enrs = discv5_servers.iter().map(|s|s.local_enr()).collect::<Vec<_>>();
-    let topology = match opts.topology.as_str() {
-        "linear" => Topology::Linear,
-        _ => Topology::Linear
-    };
-    match topology {
+    match opts.topology {
         Topology::Linear => {
             for (i, s) in discv5_servers.iter().enumerate() {
                 if i != discv5_servers.len() - 1 {
-                    s.add_enr(enrs[i+1].clone()).unwrap()
+                    s.add_enr(discv5_servers[i+1].local_enr().clone()).unwrap()
                 }
             }
         },
