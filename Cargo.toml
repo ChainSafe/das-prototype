@@ -26,6 +26,10 @@ itertools = "0.10"
 rand = "0.8"
 sha3 = "0.10"
 
+libp2p = { version = "0.40.0" }
+unsigned-varint = "0.7.1"
+async-trait = "0.1.58"
+
 rocket = { version = "0.5.0-rc.2", features = ["json"] }
 reqwest = "0.11.12"
 cli-batteries = "0.3"

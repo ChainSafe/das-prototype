@@ -1,11 +1,12 @@
 #[macro_use]
 extern crate rocket;
+extern crate core;
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use discv5::{enr, enr::{CombinedKey, NodeId, Enr}, Discv5, Discv5Config, Discv5Event, Key, Discv5ConfigBuilder, ConnectionState, ConnectionDirection, TalkRequest};
 use warp::Filter;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::AddAssign;
 use std::rc::Rc;
 use tokio::{select, time};
@@ -14,10 +15,13 @@ use tracing::{info, log::warn, info_span, trace_span, Instrument};
 use std::sync::{Arc};
 use std::thread::sleep;
 use std::time::Duration;
+use ::libp2p::{identity, Multiaddr, PeerId};
+use ::libp2p::multiaddr::Protocol::Tcp;
 use cli_batteries::{version};
 use clap::Parser;
 use discv5::kbucket::{BucketIndex, KBucketsTable, Node, NodeStatus};
 use enr::k256::elliptic_curve::bigint::Encoding;
+use enr::k256::elliptic_curve::weierstrass::add;
 use enr::k256::U256;
 use futures::{pin_mut, FutureExt};
 use futures::stream::FuturesUnordered;
@@ -26,10 +30,14 @@ use rand::Rng;
 use sha3::{Keccak256, Digest};
 use strum::EnumString;
 use tokio::sync::{mpsc, RwLock};
-use crate::rpc::RpcMsg;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::task::spawn_blocking;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use crate::libp2p::Libp2pService;
+use crate::http_rpc::RpcMsg;
 
-mod types;
-mod rpc;
+mod http_rpc;
+mod libp2p;
 
 #[derive(Clone, Debug, PartialEq, EnumString)]
 enum Topology {
@@ -51,6 +59,16 @@ enum SimCase {
     BucketCast
 }
 
+#[derive(Clone, Debug, PartialEq, EnumString)]
+pub enum TalkWire {
+    #[strum(serialize = "discv5")]
+    Discv5,
+    #[strum(serialize = "rpc")]
+    HttpRPC,
+    #[strum(serialize = "libp2p")]
+    Libp2p
+}
+
 #[derive(Clone, Parser)]
 pub struct Options {
     #[clap(long, short, default_value = "127.0.0.1")]
@@ -63,19 +81,21 @@ pub struct Options {
     topology: Topology,
     #[clap(long, short, default_value = "1")]
     simulation_case: SimCase,
-    #[clap(long, short)]
-    with_rpc: bool
+    #[clap(long, default_value = "discv5")]
+    talk_wire: TalkWire
 }
 
 pub struct DASNode {
-    dht: Discv5,
-    samples: HashMap<NodeId, ()>
+    discv5: Discv5,
+    libp2p: Libp2pService,
+    samples: HashMap<NodeId, ()>,
 }
 
 impl DASNode {
-    pub fn new(dht: Discv5) -> Self {
+    pub fn new(discv5: Discv5, libp2p: Libp2pService) -> Self {
         Self {
-            dht,
+            discv5,
+            libp2p,
             samples: Default::default(),
         }
     }
@@ -98,22 +118,47 @@ async fn app(options: Options) -> eyre::Result<()> {
 
     let mut das_nodes = vec![];
 
-    for (i, s) in discv5_servers.into_iter().enumerate() {
-        let mut events_str = ReceiverStream::new(s.event_stream().await.unwrap());
+    let enr_to_libp2p = Arc::new(RwLock::new(HashMap::default()));
+
+    for (i, discv5) in discv5_servers.into_iter().enumerate() {
+        let mut events_str = ReceiverStream::new(discv5.event_stream().await.unwrap());
         let opts = options.clone();
-        let srv = Arc::new(RwLock::new(DASNode::new(s)));
+
+        let (mut libp2p_worker, libp2p_msgs, libp2p_service) = {
+            let keypair = identity::Keypair::generate_ed25519();
+            let peer_id = PeerId::from(keypair.public());
+            let mut addr = Multiaddr::from(IpAddr::from([127, 0, 0, 1]));
+            addr.push(Tcp(4000+i as u16));
+
+            enr_to_libp2p.write().await.insert(discv5.local_enr().node_id(), (peer_id, addr.clone()));
+
+            libp2p::Libp2pDaemon::new(keypair, addr, i)
+        };
+        let mut libp2p_msgs = UnboundedReceiverStream::new(libp2p_msgs);
+        let srv = Arc::new(RwLock::new(DASNode::new(discv5, libp2p_service)));
         das_nodes.push(srv.clone());
         let (tx, rx) = mpsc::channel(1);
         let mut rpc_str = ReceiverStream::new(rx);
 
+        let talk_wire = opts.talk_wire.clone();
         tokio::spawn(async move {
-            let mut rpc_future = FuturesUnordered::new();
-            rpc_future.push(rpc::serve(tx, ([127, 0, 0, 1], 3000+i as u16)));
-            // pin_mut!(rpc_future);
-            'outer: loop {
+            match talk_wire {
+                TalkWire::HttpRPC => {
+                    http_rpc::serve(tx, ([127, 0, 0, 1], 3000+i as u16)).await;
+                }
+                TalkWire::Libp2p => {
+                    libp2p_worker.run().await;
+                }
+                _ => {}
+            }
+        });
+
+        let addr_book = enr_to_libp2p.clone();
+        tokio::spawn(async move {
+            loop {
                 select! {
                     Some(e) = events_str.next() => {
-                        let chan = format!("{i} {}", srv.read().await.dht.local_enr().node_id().to_string());
+                        let chan = format!("{i} {}", srv.read().await.discv5.local_enr().node_id().to_string());
                         match e {
                             Discv5Event::Discovered(enr) => {
                                 info!("Stream {}: Enr discovered {}", chan, enr)
@@ -133,18 +178,21 @@ async fn app(options: Options) -> eyre::Result<()> {
                             }
                             Discv5Event::TalkRequest(req) => {
                                 info!("Stream {}: Talk request received", chan);
-                                let resp = talk_response(req.body().to_vec(), srv.clone(), &opts).await;
+                                let resp = talk_response(req.body().to_vec(), srv.clone(), &opts, addr_book.clone()).await;
                                 req.respond(resp);
                             },
                         }
                     },
                     Some(m) = rpc_str.next() => match m {
                         RpcMsg::TalkReq(body, tx) => {
-                            info!("RPC: Talk request received");
-                            tx.send(talk_response(body, srv.clone(), &opts).await);
+                            info!("RPC {i}: Talk request received");
+                            tx.send(talk_response(body, srv.clone(), &opts, addr_book.clone()).await);
                         }
                     },
-                    _ = rpc_future.next() => {return;},
+                    Some(crate::libp2p::TalkReqMsg{resp_tx, peer_id, payload}) = libp2p_msgs.next() => {
+                        info!("Libp2p {i}: Talk request received");
+                            resp_tx.send(Ok(talk_response(payload, srv.clone(), &opts, addr_book.clone()).await));
+                    }
                 }
             }
         });
@@ -153,7 +201,7 @@ async fn app(options: Options) -> eyre::Result<()> {
     let stats_task = tokio::spawn(async move {
         let enrs = enrs_stats;
 
-        play_simulation(&options, &das_nodes).await;
+        play_simulation(&options, &das_nodes, enr_to_libp2p.clone()).await;
 
         // let peer_count = das_nodes
         //     .iter()
@@ -276,15 +324,19 @@ pub fn set_topology(opts: &Options, mut discv5_servers: Vec<Discv5>) -> Vec<Disc
     discv5_servers
 }
 
-pub async fn play_simulation(opts: &Options, nodes: &Vec<Arc<RwLock<DASNode>>>) {
+pub async fn play_simulation(
+    opts: &Options,
+    nodes: &Vec<Arc<RwLock<DASNode>>>,
+    addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>
+) {
     match opts.simulation_case {
         SimCase::LinearRouting => {
             let last_node = nodes.last().unwrap().read().await;
-            let last_node_id = last_node.dht.local_enr().node_id();
+            let last_node_id = last_node.discv5.local_enr().node_id();
             let span = info_span!("routing", target_key=last_node_id.to_string());
             // let last_node_upd4 = last_node.local_enr().udp4().unwrap().clone();
             // let predicate = Box::new(move |enr: &Enr<CombinedKey>| enr.udp4().unwrap() == last_node_upd4);
-            let found = nodes[0].read().await.dht.find_node(last_node_id).instrument(span).await.unwrap();
+            let found = nodes[0].read().await.discv5.find_node(last_node_id).instrument(span).await.unwrap();
             info!("found_nodes {}", found.len());
             // send talkreq from first node to last node
             // let resp = discv5_servers[0].talk_req(enrs[enrs.len()-1].clone(), b"123".to_vec(), format!("hello{}",0).into_bytes()).await.unwrap();
@@ -292,7 +344,7 @@ pub async fn play_simulation(opts: &Options, nodes: &Vec<Arc<RwLock<DASNode>>>) 
         }
         SimCase::ClosestToValue => {
             let last_node = nodes.last().unwrap().read().await;
-            let last_node_id = last_node.dht.local_enr().node_id();
+            let last_node_id = last_node.discv5.local_enr().node_id();
 
             let distant_key = {
                 let hash = U256::from_be_slice(last_node_id.raw().as_ref());
@@ -301,16 +353,16 @@ pub async fn play_simulation(opts: &Options, nodes: &Vec<Arc<RwLock<DASNode>>>) 
             };
 
             let span = info_span!("routing", target_key=distant_key.to_string());
-            let found = nodes[0].read().await.dht.find_node(last_node_id).instrument(span).await.unwrap();
+            let found = nodes[0].read().await.discv5.find_node(last_node_id).instrument(span).await.unwrap();
             info!("found_nodes {}", found.len());
         }
         SimCase::BucketCast => {
             let node = nodes[0].read().await;
-            let local_view: HashMap<_, _> = node.dht.kbuckets().buckets_iter()
+            let local_view: HashMap<_, _> = node.discv5.kbuckets().buckets_iter()
                 .map(|kb| kb.iter().map(|e| e.key.clone()).collect::<Vec<_>>())
                 .enumerate().collect();
 
-            let local_key = Key::from(node.dht.local_enr().node_id());
+            let local_key = Key::from(node.discv5.local_enr().node_id());
 
             let keys = (0..256usize).map(|i| {
                 let mut h = Keccak256::new();
@@ -324,57 +376,60 @@ pub async fn play_simulation(opts: &Options, nodes: &Vec<Arc<RwLock<DASNode>>>) 
 
             // alloc.clone().into_iter().filter(|(i, ks)| ks.len() > 0).for_each(|(i, keys)| info!(k={i}, keys=keys.len(), nodes=local_view.get(&i).unwrap().len()));
 
-
             let mut futures = vec![];
             for (k, keys) in alloc.into_iter() {
                 let local_nodes = local_view.get(&k).unwrap();
 
                 if let Some(next) = local_nodes.first() {
                     let node = nodes[0].read().await;
-                    let enr = node.dht.find_enr(next.preimage()).unwrap();
+                    let enr = node.discv5.find_enr(next.preimage()).unwrap();
+                    let addr_book = addr_book.clone();
 
                     futures.push(Box::pin(async move {
-                        if opts.with_rpc {
-                            let msg = {
-                                let mut m = vec![];
-                                let mut w = BufWriter::new(&mut *m);
-                                keys.iter().for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
-                                w.buffer().to_vec()
-                            };
-                            node.dht.find_enr().unwrap().ke
-                           let _ = rpc::talk_req(enr.clone(), msg).await;
-                        } else {
-                            let mut i = 0;
-                            loop {
-                                let msg = {
-                                    let mut m = vec![];
-                                    let mut w = BufWriter::new(&mut *m);
-                                    keys.iter().skip(i*29).take(29).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
-                                    w.buffer().to_vec()
-                                };
+                        let msg = {
+                            let mut m = vec![];
+                            let mut w = BufWriter::new(&mut *m);
+                            keys.iter().for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
+                            w.buffer().to_vec()
+                        };
 
-                                if msg.len() == 0 {
-                                    break
-                                }
+                        match opts.talk_wire {
+                            TalkWire::Discv5 => {
+                                let mut i = 0;
+                                loop {
+                                    let msg = {
+                                        let mut m = vec![];
+                                        let mut w = BufWriter::new(&mut *m);
+                                        keys.iter().skip(i*29).take(29).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
+                                        w.buffer().to_vec()
+                                    };
 
-                                i+=1;
-                                let _ = node.dht.talk_req(enr.clone(), b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{e}"));
+                                    if msg.len() == 0 {
+                                        break
+                                    }
+
+                                    i+=1;
+                                    let _ = node.discv5.talk_req(enr.clone(), b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{e}"));
+                                }                            }
+                            TalkWire::Libp2p => {
+                                let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
+                                let _ = node.libp2p.talk_req(&peer_id, &addr, msg).await.unwrap();
+                            }
+                            TalkWire::HttpRPC => {
+                                let _ = http_rpc::talk_req(enr.clone(), msg).await;
                             }
                         }
                     }));
                 }
             }
             futures::future::join_all(futures).instrument(info_span!("bucket-cast")).await;
-            // async move {
-            //     while let Some(resp) = futures::future::select_all(futures) { resp.unwrap(); };
-            // }.instrument(info_span!("bucket-cast")).await;
 
             let mut keys_per_node = HashMap::new();
             let mut nodes_per_key = HashMap::<_, usize>::new();
 
             for n in nodes {
                 let n = n.read().await;
-                keys_per_node.insert(n.dht.local_enr().node_id(), n.samples.len());
+                keys_per_node.insert(n.discv5.local_enr().node_id(), n.samples.len());
                 n.samples.keys().for_each(|k| {
                     nodes_per_key.entry(k.clone())
                         .and_modify(|e| e.add_assign(1))
@@ -392,7 +447,12 @@ pub async fn play_simulation(opts: &Options, nodes: &Vec<Arc<RwLock<DASNode>>>) 
     }
 }
 
-pub async fn talk_response(msg: Vec<u8>, node: Arc<RwLock<DASNode>>, opts: &Options) -> Vec<u8> {
+pub async fn talk_response(
+    msg: Vec<u8>,
+    node: Arc<RwLock<DASNode>>,
+    opts: &Options,
+    addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>
+) -> Vec<u8> {
     match opts.simulation_case {
         SimCase::BucketCast => {
             let mut r = BufReader::new(&*msg);
@@ -407,14 +467,14 @@ pub async fn talk_response(msg: Vec<u8>, node: Arc<RwLock<DASNode>>, opts: &Opti
                 keys.push(NodeId::new(&b))
             }
 
-            let local_view: HashMap<_, _> = node.read().await.dht.kbuckets().buckets_iter()
+            let local_view: HashMap<_, _> = node.read().await.discv5.kbuckets().buckets_iter()
                 .map(|kb| kb.iter().map(|e| e.key.clone()).collect::<Vec<_>>())
                 .enumerate().collect();
 
             // println!("Local view:");
             // local_view.iter().filter(|(_, v)|v.len() > 0).for_each(|(k,v)| println!("k={}, ns={}", *k, v.len()));
 
-            let local_key = Key::from(node.read().await.dht.local_enr().node_id());
+            let local_key = Key::from(node.read().await.discv5.local_enr().node_id());
 
             let alloc = keys.into_iter()
                 .map(|k| (BucketIndex::new(&local_key.distance(&Key::from(k))).unwrap().get(), Key::from(k)))
@@ -429,7 +489,7 @@ pub async fn talk_response(msg: Vec<u8>, node: Arc<RwLock<DASNode>>, opts: &Opti
                 let nodes = local_view.get(&k).unwrap();
 
                 if let Some(next) = nodes.first() {
-                    let enr = node.read().await.dht.find_enr(next.preimage()).unwrap();
+                    let enr = node.read().await.discv5.find_enr(next.preimage()).unwrap();
 
                     let msg = {
                         let mut m = vec![];
@@ -440,11 +500,19 @@ pub async fn talk_response(msg: Vec<u8>, node: Arc<RwLock<DASNode>>, opts: &Opti
 
                     {
                         let n = node.clone();
+                        let addr_book = addr_book.clone();
                         futures.push(async move {
-                            if opts.with_rpc {
-                                rpc::talk_req(enr, msg).await
-                            } else {
-                                n.read().await.dht.talk_req(enr, b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{}", e))
+                            match opts.talk_wire {
+                                TalkWire::Discv5 => {
+                                    n.read().await.discv5.talk_req(enr, b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{}", e))
+                                }
+                                TalkWire::Libp2p => {
+                                    let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
+                                    n.read().await.libp2p.talk_req(&peer_id, &addr, msg).await
+                                }
+                                TalkWire::HttpRPC => {
+                                    http_rpc::talk_req(enr, msg).await
+                                }
                             }
                         });
                     }
