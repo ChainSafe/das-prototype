@@ -907,6 +907,7 @@ dependencies = [
  "itertools",
  "libp2p",
  "libp2p-core 0.36.0",
+ "nanoid",
  "parking_lot 0.11.2",
  "rand 0.8.5",
  "reqwest",
@@ -2909,6 +2910,15 @@ dependencies = [
  "pin-project 1.0.12",
  "smallvec",
  "unsigned-varint",
+]
+
+[[package]]
+name = "nanoid"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ffa00dec017b5b1a8b7cf5e2c008bfda1aa7e0697ac1508b491fdf2622fb4d8"
+dependencies = [
+ "rand 0.8.5",
 ]
 
 [[package]]

@@ -24,8 +24,9 @@ use enr::k256::elliptic_curve::bigint::Encoding;
 use enr::k256::elliptic_curve::weierstrass::add;
 use enr::k256::U256;
 use futures::{pin_mut, FutureExt};
-use futures::stream::FuturesUnordered;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 use itertools::Itertools;
+use nanoid::nanoid;
 use rand::Rng;
 use sha3::{Keccak256, Digest};
 use strum::EnumString;
@@ -82,23 +83,45 @@ pub struct Options {
     #[clap(long, short, default_value = "1")]
     simulation_case: SimCase,
     #[clap(long, default_value = "discv5")]
-    talk_wire: TalkWire
+    talk_wire: TalkWire,
+    #[clap(long, short, default_value = "0")]
+    redundancy: usize
 }
 
+#[derive(Clone)]
 pub struct DASNode {
-    discv5: Discv5,
+    discv5: Arc<Discv5>,
     libp2p: Libp2pService,
-    samples: HashMap<NodeId, ()>,
+    samples: Arc<RwLock<HashMap<NodeId, ()>>>,
+    handled_ids: Arc<RwLock<HashMap<Vec<u8>, ()>>>,
 }
 
 impl DASNode {
     pub fn new(discv5: Discv5, libp2p: Libp2pService) -> Self {
         Self {
-            discv5,
+            discv5: Arc::new(discv5),
             libp2p,
             samples: Default::default(),
+            handled_ids: Default::default()
         }
     }
+}
+
+macro_rules! clone_all {
+    ($i:ident) => {
+        let $i = $i.clone();
+    };
+    ($i:ident, $($tt:tt)*) => {
+        clone_all!($i);
+        clone_all!($($tt)*);
+    };
+    ($this:ident . $i:ident) => {
+        let $i = $this.$i.clone();
+    };
+    ($this:ident . $i:ident, $($tt:tt)*) => {
+        clone_all!($this . $i);
+        clone_all!($($tt)*);
+    };
 }
 
 fn main() {
@@ -111,6 +134,8 @@ async fn app(options: Options) -> eyre::Result<()> {
         construct_and_start(&options, address, options.port_udp, options.node_count).await
     };
 
+    let node_ids = discv5_servers.iter().map(|e| e.local_enr().node_id()).collect::<Vec<_>>();
+
     let enrs = Arc::new(discv5_servers
         .iter()
         .map(|s| s.local_enr())
@@ -119,6 +144,7 @@ async fn app(options: Options) -> eyre::Result<()> {
     let mut das_nodes = vec![];
 
     let enr_to_libp2p = Arc::new(RwLock::new(HashMap::default()));
+    let libp2p_to_enr = Arc::new(RwLock::new(HashMap::<PeerId, NodeId>::default()));
 
     for (i, discv5) in discv5_servers.into_iter().enumerate() {
         let mut events_str = ReceiverStream::new(discv5.event_stream().await.unwrap());
@@ -131,11 +157,12 @@ async fn app(options: Options) -> eyre::Result<()> {
             addr.push(Tcp(4000+i as u16));
 
             enr_to_libp2p.write().await.insert(discv5.local_enr().node_id(), (peer_id, addr.clone()));
+            libp2p_to_enr.write().await.insert(peer_id, discv5.local_enr().node_id());
 
             libp2p::Libp2pDaemon::new(keypair, addr, i)
         };
         let mut libp2p_msgs = UnboundedReceiverStream::new(libp2p_msgs);
-        let srv = Arc::new(RwLock::new(DASNode::new(discv5, libp2p_service)));
+        let srv = DASNode::new(discv5, libp2p_service);
         das_nodes.push(srv.clone());
         let (tx, rx) = mpsc::channel(1);
         let mut rpc_str = ReceiverStream::new(rx);
@@ -154,11 +181,13 @@ async fn app(options: Options) -> eyre::Result<()> {
         });
 
         let addr_book = enr_to_libp2p.clone();
+        let peer_book = libp2p_to_enr.clone();
+        let node_ids = node_ids.clone();
         tokio::spawn(async move {
             loop {
                 select! {
                     Some(e) = events_str.next() => {
-                        let chan = format!("{i} {}", srv.read().await.discv5.local_enr().node_id().to_string());
+                        let chan = format!("{i} {}", srv.discv5.local_enr().node_id().to_string());
                         match e {
                             Discv5Event::Discovered(enr) => {
                                 info!("Stream {}: Enr discovered {}", chan, enr)
@@ -178,21 +207,30 @@ async fn app(options: Options) -> eyre::Result<()> {
                             }
                             Discv5Event::TalkRequest(req) => {
                                 info!("Stream {}: Talk request received", chan);
-                                let resp = talk_response(req.body().to_vec(), srv.clone(), &opts, addr_book.clone()).await;
-                                req.respond(resp);
+                                clone_all!(srv, opts, addr_book, node_ids);
+                                tokio::spawn(async move {
+                                    let resp = handle_talk_request(req.node_id().clone(), req.body().to_vec(), srv, opts, addr_book, node_ids, i).await;
+                                    req.respond(resp);
+                                });
                             },
                         }
                     },
                     Some(m) = rpc_str.next() => match m {
                         RpcMsg::TalkReq(body, tx) => {
                             info!("RPC {i}: Talk request received");
-                            tx.send(talk_response(body, srv.clone(), &opts, addr_book.clone()).await);
+                            let from = node_ids[0];
+                            clone_all!(srv, opts, addr_book, node_ids);
+                            tx.send(handle_talk_request(from, body, srv, opts, addr_book, node_ids, i).await);
                         }
                     },
                     Some(crate::libp2p::TalkReqMsg{resp_tx, peer_id, payload}) = libp2p_msgs.next() => {
                         info!("Libp2p {i}: Talk request received");
-                            resp_tx.send(Ok(talk_response(payload, srv.clone(), &opts, addr_book.clone()).await));
-                    }
+                        let from = peer_book.read().await.get(&peer_id).unwrap().clone();
+                        clone_all!(srv, opts, addr_book, node_ids);
+                        tokio::spawn(async move {
+                            resp_tx.send(Ok(handle_talk_request(from, payload, srv, opts, addr_book, node_ids, i).await));
+                        });
+                    },
                 }
             }
         });
@@ -201,7 +239,7 @@ async fn app(options: Options) -> eyre::Result<()> {
     let stats_task = tokio::spawn(async move {
         let enrs = enrs_stats;
 
-        play_simulation(&options, &das_nodes, enr_to_libp2p.clone()).await;
+        play_simulation(&options, &das_nodes, enr_to_libp2p.clone(), node_ids).await;
 
         // let peer_count = das_nodes
         //     .iter()
@@ -326,24 +364,25 @@ pub fn set_topology(opts: &Options, mut discv5_servers: Vec<Discv5>) -> Vec<Disc
 
 pub async fn play_simulation(
     opts: &Options,
-    nodes: &Vec<Arc<RwLock<DASNode>>>,
-    addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>
+    nodes: &Vec<DASNode>,
+    addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
+    node_ids: Vec<NodeId>,
 ) {
     match opts.simulation_case {
         SimCase::LinearRouting => {
-            let last_node = nodes.last().unwrap().read().await;
+            let last_node = nodes.last().unwrap();
             let last_node_id = last_node.discv5.local_enr().node_id();
             let span = info_span!("routing", target_key=last_node_id.to_string());
             // let last_node_upd4 = last_node.local_enr().udp4().unwrap().clone();
             // let predicate = Box::new(move |enr: &Enr<CombinedKey>| enr.udp4().unwrap() == last_node_upd4);
-            let found = nodes[0].read().await.discv5.find_node(last_node_id).instrument(span).await.unwrap();
+            let found = nodes[0].discv5.find_node(last_node_id).instrument(span).await.unwrap();
             info!("found_nodes {}", found.len());
             // send talkreq from first node to last node
             // let resp = discv5_servers[0].talk_req(enrs[enrs.len()-1].clone(), b"123".to_vec(), format!("hello{}",0).into_bytes()).await.unwrap();
             // info!("Got response: {}", String::from_utf8(resp).unwrap());
         }
         SimCase::ClosestToValue => {
-            let last_node = nodes.last().unwrap().read().await;
+            let last_node = nodes.last().unwrap();
             let last_node_id = last_node.discv5.local_enr().node_id();
 
             let distant_key = {
@@ -353,11 +392,11 @@ pub async fn play_simulation(
             };
 
             let span = info_span!("routing", target_key=distant_key.to_string());
-            let found = nodes[0].read().await.discv5.find_node(last_node_id).instrument(span).await.unwrap();
+            let found = nodes[0].discv5.find_node(last_node_id).instrument(span).await.unwrap();
             info!("found_nodes {}", found.len());
         }
         SimCase::BucketCast => {
-            let node = nodes[0].read().await;
+            let node = nodes[0].clone();
             let local_view: HashMap<_, _> = node.discv5.kbuckets().buckets_iter()
                 .map(|kb| kb.iter().map(|e| e.key.clone()).collect::<Vec<_>>())
                 .enumerate().collect();
@@ -370,6 +409,8 @@ pub async fn play_simulation(
                 NodeId::new(&h.finalize().try_into().unwrap())
             });
 
+            info!("number of keys={}", keys.len());
+
             let alloc = keys
                 .map(|k| (BucketIndex::new(&local_key.distance(&Key::from(k))).unwrap().get(), Key::from(k)))
                 .into_group_map();
@@ -377,68 +418,96 @@ pub async fn play_simulation(
             // alloc.clone().into_iter().filter(|(i, ks)| ks.len() > 0).for_each(|(i, keys)| info!(k={i}, keys=keys.len(), nodes=local_view.get(&i).unwrap().len()));
 
             let mut futures = vec![];
-            for (k, keys) in alloc.into_iter() {
+            let mut leftover_keys = vec![];
+            for (k, mut keys) in alloc.into_iter() {
                 let local_nodes = local_view.get(&k).unwrap();
+                let forward_to = local_nodes.iter().take(1 + opts.redundancy).collect::<Vec<_>>();
 
-                if let Some(next) = local_nodes.first() {
-                    let node = nodes[0].read().await;
-                    let enr = node.discv5.find_enr(next.preimage()).unwrap();
-                    let addr_book = addr_book.clone();
+                if !forward_to.is_empty() {
+                    if forward_to.len() < 1 + opts.redundancy {
+                        warn!("bucket {k} contains less nodes than needed for redundancy settings ({})", opts.redundancy);
+                    }
 
-                    futures.push(Box::pin(async move {
-                        let msg = {
-                            let mut m = vec![];
-                            let mut w = BufWriter::new(&mut *m);
-                            keys.iter().for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
-                            w.buffer().to_vec()
-                        };
+                    let msg = {
+                        let mut m = vec![];
+                        let mut w = BufWriter::new(&mut *m);
+                        w.write(&*nanoid!(8).into_bytes()).unwrap();
+                        keys.iter().for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
+                        w.buffer().to_vec()
+                    };
 
-                        match opts.talk_wire {
-                            TalkWire::Discv5 => {
-                                let mut i = 0;
-                                loop {
-                                    let msg = {
-                                        let mut m = vec![];
-                                        let mut w = BufWriter::new(&mut *m);
-                                        keys.iter().skip(i*29).take(29).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
-                                        w.buffer().to_vec()
-                                    };
+                    for next in forward_to {
+                        let node = nodes[0].clone();
+                        let enr = node.discv5.find_enr(next.preimage()).unwrap();
+                        let addr_book = addr_book.clone();
 
-                                    if msg.len() == 0 {
-                                        break
-                                    }
-
-                                    i+=1;
-                                    let _ = node.discv5.talk_req(enr.clone(), b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{e}"));
-                                }                            }
-                            TalkWire::Libp2p => {
-                                let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
-                                let _ = node.libp2p.talk_req(&peer_id, &addr, msg).await.unwrap();
-                            }
-                            TalkWire::HttpRPC => {
-                                let _ = http_rpc::talk_req(enr.clone(), msg).await;
-                            }
+                        {
+                            let next_i = node_ids.iter().position(|e| *e == *next.preimage()).unwrap();
+                            info!("sending {} keys from {} ({}) to {} ({})", keys.len(), node.discv5.local_enr().node_id(), 0, next.preimage(), next_i);
                         }
-                    }));
+
+                        clone_all!(msg, keys);
+                        futures.push(Box::pin(async move {
+                            match opts.talk_wire {
+                                TalkWire::Discv5 => {
+                                    let mut i = 0;
+                                    loop {
+                                        let id = &*nanoid!(8).into_bytes();
+                                        let msg = {
+                                            let mut m = vec![];
+                                            let mut w = BufWriter::new(&mut *m);
+                                            w.write(id.clone()).unwrap();
+                                            keys.iter().skip(i*28).take(28).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
+                                            w.buffer().to_vec()
+                                        };
+
+                                        if msg.len() == 8 {
+                                            break
+                                        }
+
+                                        i+=1;
+                                        let _ = node.discv5.talk_req(enr.clone(), b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{e}"));
+                                    }
+                                }
+                                TalkWire::Libp2p => {
+                                    let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
+                                    let _ = node.libp2p.talk_req(&peer_id, &addr, msg).await.unwrap();
+                                }
+                                TalkWire::HttpRPC => {
+                                    let _ = http_rpc::talk_req(enr.clone(), msg).await;
+                                }
+                            }
+                        }));
+                    }
+                } else {
+                    warn!("fail to forward {} keys to {} bucket", keys.len(), k);
+                    leftover_keys.append(&mut keys);
                 }
             }
             futures::future::join_all(futures).instrument(info_span!("bucket-cast")).await;
+
+            {
+                let mut samples = nodes[0].samples.write().await;
+                leftover_keys.into_iter().for_each(|e| {
+                    samples.insert(e.preimage().clone(), ());
+                });
+            }
 
             let mut keys_per_node = HashMap::new();
             let mut nodes_per_key = HashMap::<_, usize>::new();
 
             for n in nodes {
-                let n = n.read().await;
-                keys_per_node.insert(n.discv5.local_enr().node_id(), n.samples.len());
-                n.samples.keys().for_each(|k| {
+                let samples = n.samples.read().await;
+                keys_per_node.insert(n.discv5.local_enr().node_id(), samples.len());
+                samples.keys().for_each(|k| {
                     nodes_per_key.entry(k.clone())
                         .and_modify(|e| e.add_assign(1))
                         .or_insert(1);
                 })
             }
 
-            // println!("Keys per Node:");
-            // keys_per_node.iter().filter(|(_, keys)| **keys > 0).for_each(|(n, keys)| println!("node={} keys={keys}", n.to_string()));
+            println!("Keys per Node:");
+            keys_per_node.iter().filter(|(_, keys)| **keys > 0).for_each(|(n, keys)| println!("node={} ({}) keys={keys}", n.to_string(), node_ids.iter().position(|e| *e == *n).unwrap()));
             println!("Nodes per Key:");
             nodes_per_key.iter().for_each(|(k, nodes)| println!("key={} nodes={nodes}", k.to_string()));
             println!("Keys total: {}", nodes_per_key.len());
@@ -447,16 +516,38 @@ pub async fn play_simulation(
     }
 }
 
-pub async fn talk_response(
+pub async fn handle_talk_request(
+    from: NodeId,
     msg: Vec<u8>,
-    node: Arc<RwLock<DASNode>>,
-    opts: &Options,
-    addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>
+    node: DASNode,
+    opts: Options,
+    addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
+    node_ids: Vec<NodeId>,
+    node_idx: usize
 ) -> Vec<u8> {
+    let from_i = node_ids.iter().position(|e| *e == from).unwrap();
     match opts.simulation_case {
         SimCase::BucketCast => {
             let mut r = BufReader::new(&*msg);
             let mut keys = vec![];
+
+            let mut id = [0;8];
+            r.read(&mut id).unwrap();
+            let id = id.to_vec();
+
+            {
+                info!("node ({node_idx}) attempts to get lock for request ({}) from {} ({})", hex::encode(&id), from, from_i);
+                let mut handled_ids = node.handled_ids.write().await;
+                if handled_ids.contains_key(&id) {
+                    info!("node ({node_idx}) skipped handled request id ({}) from {} ({})", hex::encode(&id), from, from_i);
+                    return vec![]
+                } else {
+                    handled_ids.insert(id.clone(), ());
+                    info!("node ({node_idx}) is receiving request ({}) from {} ({})", hex::encode(&id), from, from_i);
+                    drop(handled_ids);
+                }
+            }
+
 
             loop {
                 let mut b = [0;32];
@@ -467,14 +558,14 @@ pub async fn talk_response(
                 keys.push(NodeId::new(&b))
             }
 
-            let local_view: HashMap<_, _> = node.read().await.discv5.kbuckets().buckets_iter()
+            let local_view: HashMap<_, _> = node.discv5.kbuckets().buckets_iter()
                 .map(|kb| kb.iter().map(|e| e.key.clone()).collect::<Vec<_>>())
                 .enumerate().collect();
 
             // println!("Local view:");
             // local_view.iter().filter(|(_, v)|v.len() > 0).for_each(|(k,v)| println!("k={}, ns={}", *k, v.len()));
 
-            let local_key = Key::from(node.read().await.discv5.local_enr().node_id());
+            let local_key = Key::from(node.discv5.local_enr().node_id());
 
             let alloc = keys.into_iter()
                 .map(|k| (BucketIndex::new(&local_key.distance(&Key::from(k))).unwrap().get(), Key::from(k)))
@@ -486,41 +577,55 @@ pub async fn talk_response(
             let mut futures = FuturesUnordered::new();
 
             for (k, keys) in alloc.into_iter() {
-                let nodes = local_view.get(&k).unwrap();
+                let local_nodes = local_view.get(&k).unwrap();
+                let forward_to = local_nodes.iter().filter(|e| *e.preimage() != from).take(1 + opts.redundancy).collect::<Vec<_>>();
 
-                if let Some(next) = nodes.first() {
-                    let enr = node.read().await.discv5.find_enr(next.preimage()).unwrap();
+                if !forward_to.is_empty() {
+                    if forward_to.len() < 1 + opts.redundancy {
+                        warn!("bucket {k} contains less nodes than needed for redundancy settings ({})", opts.redundancy);
+                    }
 
-                    let msg = {
-                        let mut m = vec![];
-                        let mut w = BufWriter::new(&mut *m);
-                        keys.into_iter().for_each(|k| { let _ = w.write(&*k.hash.to_vec()); });
-                        w.buffer().to_vec()
-                    };
+                    for next in forward_to {
+                        let enr = node.discv5.find_enr(next.preimage()).unwrap();
 
-                    {
-                        let n = node.clone();
-                        let addr_book = addr_book.clone();
-                        futures.push(async move {
-                            match opts.talk_wire {
-                                TalkWire::Discv5 => {
-                                    n.read().await.discv5.talk_req(enr, b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{}", e))
+                        let next_i = node_ids.iter().position(|e| *e == *next.preimage()).unwrap();
+                        info!("sending {} keys for request ({}) from {} ({}) to {} ({})", keys.len(), hex::encode(&id), node.discv5.local_enr().node_id(), node_idx, next.preimage(), next_i);
+
+                        let msg = {
+                            let mut m = vec![];
+                            let mut w = BufWriter::new(&mut *m);
+                            w.write(&mut id.clone()).unwrap();
+                            keys.clone().into_iter().for_each(|k| { let _ = w.write(&*k.hash.to_vec()); });
+                            w.buffer().to_vec()
+                        };
+
+                        {
+                            clone_all!(node, addr_book, opts, id, keys);
+                            futures.push(async move {
+                                match opts.talk_wire {
+                                    TalkWire::Discv5 => {
+                                        let x = node.discv5.talk_req(enr, b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("error making request ({}) from {node_idx} to {next_i}: {}", hex::encode(&id), e));
+                                        if x.is_ok() {
+                                            info!("success pushing {} keys for request ({}) from {} ({}) to {} ({})", keys.len(), hex::encode(&id), node.discv5.local_enr().node_id(), node_idx, next.preimage(), next_i);
+                                        }
+                                        x
+                                    }
+                                    TalkWire::Libp2p => {
+                                        let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
+                                        node.libp2p.talk_req(&peer_id, &addr, msg).await
+                                    }
+                                    TalkWire::HttpRPC => {
+                                        http_rpc::talk_req(enr, msg).await
+                                    }
                                 }
-                                TalkWire::Libp2p => {
-                                    let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
-                                    n.read().await.libp2p.talk_req(&peer_id, &addr, msg).await
-                                }
-                                TalkWire::HttpRPC => {
-                                    http_rpc::talk_req(enr, msg).await
-                                }
-                            }
-                        });
+                            });
+                        }
                     }
                 } else {
-                    let mut n = node.write().await;
-                    keys.into_iter().for_each(|k| {
-                        n.samples.insert(k.preimage().clone(), ());
-                    })
+                    let mut samples = node.samples.write().await;
+                    keys.into_iter().for_each(|e| {
+                        samples.insert(e.preimage().clone(), ());
+                    });
                 }
             }
 

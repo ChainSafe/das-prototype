@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use discv5::Enr;
 use enr::k256::elliptic_curve::weierstrass::add;
+use enr::NodeId;
 use eyre::anyhow;
 use futures::future::BoxFuture;
 use futures::{SinkExt};
@@ -20,7 +21,7 @@ struct Runtime {
 }
 
 #[post("/talk_req", data = "<req>")]
-async fn api_talk_req(state: &State<Runtime>, req: Vec<u8>) -> Result<Vec<u8>, status::Custom<String>> {
+async fn api_talk_req(state: &State<Runtime>,req: Vec<u8>) -> Result<Vec<u8>, status::Custom<String>> {
     let (tx, rx) = oneshot::channel();
 
     state
