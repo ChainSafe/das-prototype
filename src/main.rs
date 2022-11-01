@@ -493,7 +493,7 @@ pub async fn play_simulation(
                 addr_book.clone(),
                 &node_ids,
             )
-            .await;
+                .await;
         }
         _ => {}
     }

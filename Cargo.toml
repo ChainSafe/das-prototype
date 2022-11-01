@@ -23,6 +23,7 @@ eth2_ssz_derive = "0.3.0"
 warp = "0.3"
 strum = {version = "0.24", features = ["derive"] }
 itertools = "0.10"
+dyn-clone = "1.0"
 rand = "0.8"
 sha3 = "0.10"
 nanoid = "0.4.0"
