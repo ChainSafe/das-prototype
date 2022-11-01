@@ -19,7 +19,7 @@ use std::time::Duration;
 use ::libp2p::{identity, Multiaddr, PeerId};
 use ::libp2p::multiaddr::Protocol::Tcp;
 use cli_batteries::{version};
-use clap::Parser;
+use clap::{Parser, Subcommand, Args};
 use discv5::kbucket::{BucketIndex, KBucketsTable, Node, NodeStatus};
 use enr::k256::elliptic_curve::bigint::Encoding;
 use enr::k256::elliptic_curve::weierstrass::add;
@@ -51,18 +51,6 @@ enum Topology {
 }
 
 #[derive(Clone, Debug, PartialEq, EnumString)]
-enum SimCase {
-    #[strum(serialize = "0")]
-    SequentiaDiscovery,
-    #[strum(serialize = "1")]
-    LinearRouting,
-    #[strum(serialize = "2")]
-    ClosestToValue,
-    #[strum(serialize = "3")]
-    BucketCast
-}
-
-#[derive(Clone, Debug, PartialEq, EnumString)]
 pub enum TalkWire {
     #[strum(serialize = "discv5")]
     Discv5,
@@ -74,7 +62,7 @@ pub enum TalkWire {
 
 // Defines settings how samples are forwarded when redundancy is enabled
 #[derive(Clone, Debug, PartialEq, EnumString)]
-pub enum ForwardMode {
+pub enum ForwardPolicy {
     // forward only the first message of the type
     #[strum(serialize = "F1")]
     ForwardOne,
@@ -107,16 +95,35 @@ pub struct Options {
     node_count: usize,
     #[clap(long, short, default_value = "linear")]
     topology: Topology,
-    #[clap(long, short, default_value = "1")]
-    simulation_case: SimCase,
     #[clap(long, default_value = "discv5")]
     talk_wire: TalkWire,
-    #[clap(long, short, default_value = "0")]
-    redundancy: usize,
+
+    #[command(subcommand)]
+    simulation_case: SimulationCase,
+}
+
+#[derive(Clone, clap::Subcommand)]
+enum SimulationCase {
+    Disseminate(DisseminationArgs),
+    Sample(SamplingArgs)
+}
+
+#[derive(Clone, Args)]
+struct DisseminationArgs {
+    #[clap(long, short, default_value = "256")]
+    number_of_samples: usize,
     #[clap(long, default_value = "F1")]
-    forward_mode: ForwardMode,
+    forward_mode: ForwardPolicy,
     #[clap(long, default_value = "R1")]
-    replicate_mode: ReplicatePolicy
+    replicate_mode: ReplicatePolicy,
+    #[clap(long, short, default_value = "1")]
+    redundancy: usize,
+}
+
+#[derive(Clone, Args)]
+struct SamplingArgs {
+    #[clap(flatten)]
+    dissemination: DisseminationArgs,
 }
 
 #[derive(Clone)]
@@ -129,6 +136,7 @@ pub struct DASNode {
 
 impl DASNode {
     pub fn new(discv5: Discv5, libp2p: Libp2pService) -> Self {
+
         Self {
             discv5: Arc::new(discv5),
             libp2p,
@@ -407,129 +415,15 @@ pub async fn play_simulation(
     addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
     node_ids: Vec<NodeId>,
 ) {
-    match opts.simulation_case {
-        SimCase::LinearRouting => {
-            let last_node = nodes.last().unwrap();
-            let last_node_id = last_node.discv5.local_enr().node_id();
-            let span = info_span!("routing", target_key=last_node_id.to_string());
-            // let last_node_upd4 = last_node.local_enr().udp4().unwrap().clone();
-            // let predicate = Box::new(move |enr: &Enr<CombinedKey>| enr.udp4().unwrap() == last_node_upd4);
-            let found = nodes[0].discv5.find_node(last_node_id).instrument(span).await.unwrap();
-            info!("found_nodes {}", found.len());
-            // send talkreq from first node to last node
-            // let resp = discv5_servers[0].talk_req(enrs[enrs.len()-1].clone(), b"123".to_vec(), format!("hello{}",0).into_bytes()).await.unwrap();
-            // info!("Got response: {}", String::from_utf8(resp).unwrap());
-        }
-        SimCase::ClosestToValue => {
-            let last_node = nodes.last().unwrap();
-            let last_node_id = last_node.discv5.local_enr().node_id();
-
-            let distant_key = {
-                let hash = U256::from_be_slice(last_node_id.raw().as_ref());
-                let raw = hash ^ U256::ONE;
-                NodeId::new(&raw.to_be_bytes())
-            };
-
-            let span = info_span!("routing", target_key=distant_key.to_string());
-            let found = nodes[0].discv5.find_node(last_node_id).instrument(span).await.unwrap();
-            info!("found_nodes {}", found.len());
-        }
-        SimCase::BucketCast => {
-            let node = nodes[0].clone();
-            let local_view: HashMap<_, _> = node.discv5.kbuckets().buckets_iter()
-                .map(|kb| kb.iter().map(|e| e.key.clone()).collect::<Vec<_>>())
-                .enumerate().collect();
-
-            let local_key = Key::from(node.discv5.local_enr().node_id());
-
-            let keys = (0..256usize).map(|i| {
+    match &opts.simulation_case {
+        SimulationCase::Disseminate(args) => {
+            let keys = (0..args.number_of_samples).map(|i| {
                 let mut h = Keccak256::new();
                 h.update(&i.to_be_bytes());
                 NodeId::new(&h.finalize().try_into().unwrap())
             });
 
-            let alloc = keys
-                .map(|k| (BucketIndex::new(&local_key.distance(&Key::from(k))).unwrap().get(), Key::from(k)))
-                .into_group_map();
-
-            // alloc.clone().into_iter().filter(|(i, ks)| ks.len() > 0).for_each(|(i, keys)| info!(k={i}, keys=keys.len(), nodes=local_view.get(&i).unwrap().len()));
-
-            let mut futures = vec![];
-            let mut leftover_keys = vec![];
-            for (k, mut keys) in alloc.into_iter() {
-                let local_nodes = local_view.get(&k).unwrap().iter();
-                let forward_to: Vec<_> = match opts.replicate_mode {
-                    ReplicatePolicy::ReplicateOne => local_nodes.take(1).collect(),
-                    ReplicatePolicy::ReplicateSome => local_nodes.take(1 + opts.redundancy).collect(),
-                    ReplicatePolicy::ReplicateAll => local_nodes.collect()
-                };
-
-                if !forward_to.is_empty() {
-                    let batch_id = nanoid!(8).into_bytes();
-                    let msg = {
-                        let mut m = vec![];
-                        let mut w = BufWriter::new(&mut *m);
-                        w.write(&*batch_id).unwrap();
-                        keys.iter().for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
-                        w.buffer().to_vec()
-                    };
-
-                    for next in forward_to {
-                        let node = nodes[0].clone();
-                        let enr = node.discv5.find_enr(next.preimage()).unwrap();
-                        let addr_book = addr_book.clone();
-
-                        {
-                            let next_i = node_ids.iter().position(|e| *e == *next.preimage()).unwrap();
-                            debug!("node {0} ({}) sends {} keys for request (id={}) to {next_i} ({})", node.discv5.local_enr().node_id(), keys.len(), hex::encode(&batch_id), next.preimage());
-                        }
-
-                        clone_all!(msg, keys);
-                        futures.push(Box::pin(async move {
-                            match opts.talk_wire {
-                                TalkWire::Discv5 => {
-                                    let mut i = 0;
-                                    loop {
-                                        let id = &*nanoid!(8).into_bytes();
-                                        let msg = {
-                                            let mut m = vec![];
-                                            let mut w = BufWriter::new(&mut *m);
-                                            w.write(id.clone()).unwrap();
-                                            keys.iter().skip(i*29).take(29).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
-                                            w.buffer().to_vec()
-                                        };
-
-                                        if msg.len() == 8 {
-                                            break
-                                        }
-
-                                        i+=1;
-                                        let _ = node.discv5.talk_req(enr.clone(), b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{e}"));
-                                    }
-                                }
-                                TalkWire::Libp2p => {
-                                    let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
-                                    let _ = node.libp2p.talk_req(&peer_id, &addr, msg).await.unwrap();
-                                }
-                                TalkWire::HttpRPC => {
-                                    let _ = http_rpc::talk_req(enr.clone(), msg).await;
-                                }
-                            }
-                        }));
-                    }
-                } else {
-                    warn!("fail to forward {} keys to {} bucket", keys.len(), k);
-                    leftover_keys.append(&mut keys);
-                }
-            }
-            futures::future::join_all(futures).instrument(info_span!("bucket-cast")).await;
-
-            {
-                let mut samples = nodes[0].samples.write().await;
-                leftover_keys.into_iter().for_each(|e| {
-                    samples.insert(e.preimage().clone(), 1);
-                });
-            }
+            disseminate_samples(keys, opts, &args, nodes, addr_book.clone(), &node_ids).await;
 
             let mut keys_per_node = HashMap::new();
             let mut nodes_per_key = HashMap::<_, usize>::new();
@@ -544,18 +438,122 @@ pub async fn play_simulation(
                 })
             }
 
-            // info!("Keys per Node:");
-            // keys_per_node.iter().filter(|(_, keys)| **keys > 0).for_each(|(n, keys)| info!("node={} ({}) keys={keys}", n.to_string(), node_ids.iter().position(|e| *e == *n).unwrap()));
-            // info!("Nodes per Key:");
-            // nodes_per_key.iter().for_each(|(k, nodes)| info!("key={} nodes={nodes}", k.to_string()));
-            // info!("Keys total: {}", nodes_per_key.len());
+            debug!("Keys per Node:");
+            keys_per_node.iter().filter(|(_, keys)| **keys > 0).for_each(|(n, keys)| debug!("node={} ({}) keys={keys}", n.to_string(), node_ids.iter().position(|e| *e == *n).unwrap()));
+            debug!("Nodes per Key:");
+            nodes_per_key.iter().for_each(|(k, nodes)| debug!("key={} nodes={nodes}", k.to_string()));
+            debug!("Keys total: {}", nodes_per_key.len());
 
             let mut keys_stored_total = 0usize;
             keys_per_node.iter().for_each(|(n, keys)| keys_stored_total += *keys);
             info!("total keys stored = {keys_stored_total} (storage overhead)");
         }
+        SimulationCase::Sample(args) => {
+            let keys = (0..256usize).map(|i| {
+                let mut h = Keccak256::new();
+                h.update(&i.to_be_bytes());
+                NodeId::new(&h.finalize().try_into().unwrap())
+            });
+
+            disseminate_samples(keys, opts, &args.dissemination, nodes, addr_book.clone(), &node_ids).await;
+        }
         _ => {}
     }
+}
+
+async fn disseminate_samples(
+    keys: impl Iterator<Item=NodeId>,
+    opts: &Options,
+    args: &DisseminationArgs,
+    nodes: &Vec<DASNode>,
+    addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
+    node_ids: &Vec<NodeId>,
+) {
+    let node = nodes[0].clone();
+    let local_view: HashMap<_, _> = node.discv5.kbuckets().buckets_iter()
+        .map(|kb| kb.iter().map(|e| e.key.clone()).collect::<Vec<_>>())
+        .enumerate().collect();
+
+    let local_key = Key::from(node.discv5.local_enr().node_id());
+
+    let alloc = keys
+        .map(|k| (BucketIndex::new(&local_key.distance(&Key::from(k))).unwrap().get(), Key::from(k)))
+        .into_group_map();
+
+    let mut futures = vec![];
+    let mut leftover_keys = vec![];
+    for (k, mut keys) in alloc.into_iter() {
+        let local_nodes = local_view.get(&k).unwrap().iter();
+        let forward_to: Vec<_> = match args.replicate_mode {
+            ReplicatePolicy::ReplicateOne => local_nodes.take(1).collect(),
+            ReplicatePolicy::ReplicateSome => local_nodes.take(1 + args.redundancy).collect(),
+            ReplicatePolicy::ReplicateAll => local_nodes.collect()
+        };
+
+        if !forward_to.is_empty() {
+            let batch_id = nanoid!(8).into_bytes();
+            let msg = {
+                let mut m = vec![];
+                let mut w = BufWriter::new(&mut *m);
+                w.write(&*batch_id).unwrap();
+                keys.iter().for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
+                w.buffer().to_vec()
+            };
+
+            for next in forward_to {
+                let node = nodes[0].clone();
+                let enr = node.discv5.find_enr(next.preimage()).unwrap();
+                let addr_book = addr_book.clone();
+
+                {
+                    let next_i = node_ids.iter().position(|e| *e == *next.preimage()).unwrap();
+                    debug!("node {0} ({}) sends {} keys for request (id={}) to {next_i} ({})", node.discv5.local_enr().node_id(), keys.len(), hex::encode(&batch_id), next.preimage());
+                }
+
+                clone_all!(msg, keys);
+                futures.push(Box::pin(async move {
+                    match opts.talk_wire {
+                        TalkWire::Discv5 => {
+                            let mut i = 0;
+                            loop {
+                                let id = &*nanoid!(8).into_bytes();
+                                let msg = {
+                                    let mut m = vec![];
+                                    let mut w = BufWriter::new(&mut *m);
+                                    w.write(id.clone()).unwrap();
+                                    keys.iter().skip(i*29).take(29).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
+                                    w.buffer().to_vec()
+                                };
+
+                                if msg.len() == 8 {
+                                    break
+                                }
+
+                                i+=1;
+                                let _ = node.discv5.talk_req(enr.clone(), b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{e}"));
+                            }
+                        }
+                        TalkWire::Libp2p => {
+                            let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
+                            let _ = node.libp2p.talk_req(&peer_id, &addr, msg).await.unwrap();
+                        }
+                        TalkWire::HttpRPC => {
+                            let _ = http_rpc::talk_req(enr.clone(), msg).await;
+                        }
+                    }
+                }));
+            }
+        } else {
+            warn!("fail to forward {} keys to {} bucket", keys.len(), k);
+            leftover_keys.append(&mut keys);
+        }
+    }
+    futures::future::join_all(futures).instrument(info_span!("bucket-cast")).await;
+
+    let mut samples = nodes[0].samples.write().await;
+    leftover_keys.into_iter().for_each(|e| {
+        samples.insert(e.preimage().clone(), 1);
+    });
 }
 
 pub async fn handle_talk_request(
@@ -569,7 +567,7 @@ pub async fn handle_talk_request(
 ) -> Vec<u8> {
     let from_i = node_ids.iter().position(|e| *e == from).unwrap();
     match opts.simulation_case {
-        SimCase::BucketCast => {
+        SimulationCase::Disseminate(ref args) => {
             let mut r = BufReader::new(&*msg);
             let mut keys = vec![];
 
@@ -580,7 +578,7 @@ pub async fn handle_talk_request(
             {
                 debug!("node {node_idx} ({}) attempts to get lock for request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), hex::encode(&id), from);
                 let mut handled_ids = node.handled_ids.write().await;
-                if handled_ids.contains_key(&id) && opts.forward_mode != ForwardMode::ForwardAll {
+                if handled_ids.contains_key(&id) && args.forward_mode != ForwardPolicy::ForwardAll {
                     debug!("node {node_idx} ({}) skipped request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), hex::encode(&id), from);
                     return vec![]
                 } else {
@@ -621,9 +619,9 @@ pub async fn handle_talk_request(
                 let local_nodes = local_view.get(&k).unwrap();
                 /// if **replicate-all* then a receiver node applies forwards samples to more then one node in every k-bucket it handles
                 let contacts_in_bucket = local_nodes.iter().filter(|e| *e.preimage() != from);
-                let forward_to: Vec<_> = match opts.replicate_mode {
+                let forward_to: Vec<_> = match args.replicate_mode {
                     ReplicatePolicy::ReplicateOne => contacts_in_bucket.take(1).collect(),
-                    ReplicatePolicy::ReplicateSome => contacts_in_bucket.take(1 + opts.redundancy).collect(),
+                    ReplicatePolicy::ReplicateSome => contacts_in_bucket.take(1 + args.redundancy).collect(),
                     ReplicatePolicy::ReplicateAll => contacts_in_bucket.collect()
                 };
 
