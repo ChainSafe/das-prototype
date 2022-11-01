@@ -1,10 +1,9 @@
 use clap::Parser;
 use cli_batteries::version;
-use discv5::kbucket::Node;
 use discv5::{
     enr,
     enr::{CombinedKey, Enr, NodeId},
-    Discv5, Discv5Config, Discv5ConfigBuilder, Discv5Event, Key,
+    Discv5, Discv5ConfigBuilder, Discv5Event, Key,
 };
 use enr::k256::elliptic_curve::bigint::Encoding;
 use enr::k256::U256;
@@ -16,7 +15,7 @@ use std::time::Duration;
 use strum::EnumString;
 use tokio::time;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt, StreamMap};
-use tracing::{info, info_span, log::warn, trace_span, Instrument};
+use tracing::{info, info_span, Instrument};
 use warp::Filter;
 
 mod das_tree;
@@ -178,7 +177,6 @@ pub async fn play_simulation(
             let last_node = discv5_servers.last().unwrap();
             let last_node_id = last_node.local_enr().node_id();
             let span = info_span!("routing", target_key = last_node_id.to_string());
-            let last_node_upd4 = last_node.local_enr().udp4().unwrap().clone();
             // let predicate = Box::new(move |enr: &Enr<CombinedKey>| enr.udp4().unwrap() == last_node_upd4);
             let found = discv5_servers[0]
                 .find_node(last_node_id)
