@@ -7,14 +7,14 @@ edition = "2021"
 
 [dependencies]
 eyre = "0.6"
-discv5 = "*"
+discv5 = "0.1"
 tokio = { version = "1.15.0", features = ["full"] }
 enr = { version = "0.6.2", features = ["k256", "ed25519"] }
 libp2p-core = { version = "0.36.0", optional = true }
 hex = "0.4.3"
 parking_lot = "0.11.2"
 tokio-util = { version = "0.6.9", features = ["time"] }
-clap = { version = "3.2", features = [ "derive" ] }
+clap = { version = "4.0.18", features = ["derive"] }
 tracing = { version = "0.1.29" }
 futures = "0.3.24"
 tokio-stream = "0.1.10"
@@ -23,9 +23,21 @@ eth2_ssz_derive = "0.3.0"
 warp = "0.3"
 strum = {version = "0.24", features = ["derive"] }
 itertools = "0.10"
+rand = "0.8"
+sha3 = "0.10"
+nanoid = "0.4.0"
 
+libp2p = { version = "0.40.0" }
+unsigned-varint = "0.7.1"
+async-trait = "0.1.58"
 
-cli-batteries = "0.3"
+rocket = { version = "0.5.0-rc.2", features = ["json"] }
+reqwest = "0.11.12"
+cli-batteries = "0.4"
 
 [build-dependencies]
-cli-batteries = "0.3"
+cli-batteries = "0.4"
+
+[patch.crates-io]
+# discv5 = {git = "https://github.com/timoth-y/discv5"}
+discv5 = {path = "../discv5"}
