@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
 use tokio::sync::oneshot::Sender;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
-use tracing::{info, log::warn};
+use tracing::{info, debug, log::warn};
 
 
 const PROTOCOL_ID: &str = "/das/0.1.0";
@@ -118,14 +118,14 @@ impl Libp2pDaemon {
                     // Outbound events
                     Some(event) => match event {
                         SwarmEvent::Behaviour(BehaviourEvent::InboundMessage{peer}) => {
-                            info!(libp2p_node_idx=libp2p_node_idx, "Inbound message from {:?}", peer);
+                            debug!(libp2p_node_idx=libp2p_node_idx, "Inbound message from {:?}", peer);
                         },
-                        SwarmEvent::NewListenAddr { address, .. } => info!(libp2p_node_idx=libp2p_node_idx, "Listening on {:?}", address),
+                        SwarmEvent::NewListenAddr { address, .. } => debug!(libp2p_node_idx=libp2p_node_idx, "Listening on {:?}", address),
                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                            info!(libp2p_node_idx=libp2p_node_idx, "ConnectionEstablished with {:?}", peer_id.to_string());
+                            debug!(libp2p_node_idx=libp2p_node_idx, "ConnectionEstablished with {:?}", peer_id.to_string());
                         },
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                            info!(libp2p_node_idx=libp2p_node_idx, "ConnectionClosed with {:?}", peer_id.to_string());
+                            debug!(libp2p_node_idx=libp2p_node_idx, "ConnectionClosed with {:?}", peer_id.to_string());
                         }
                         _ => continue
                     }
@@ -304,10 +304,10 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<Vec<u8>, Result<Vec<u8>, 
                 self.events.push_back(BehaviourEvent::InboundMessage {peer});
             }
             RequestResponseEvent::OutboundFailure { peer, error, .. } => {
-                info!(libp2p_node_idx=node_index, "OutboundFailure {:?}: {}", peer, error);
+                debug!(libp2p_node_idx=node_index, "OutboundFailure {:?}: {}", peer, error);
             }
             RequestResponseEvent::InboundFailure { peer, error, .. } => {
-                info!(libp2p_node_idx=node_index, "InboundFailure {:?}: {}", peer, error);
+                debug!(libp2p_node_idx=node_index, "InboundFailure {:?}: {}", peer, error);
             }
             RequestResponseEvent::ResponseSent { .. } => {}
         }

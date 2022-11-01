@@ -2,6 +2,7 @@
 extern crate rocket;
 extern crate core;
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use discv5::{enr, enr::{CombinedKey, NodeId, Enr}, Discv5, Discv5Config, Discv5Event, Key, Discv5ConfigBuilder, ConnectionState, ConnectionDirection, TalkRequest};
@@ -11,7 +12,7 @@ use std::ops::AddAssign;
 use std::rc::Rc;
 use tokio::{select, time};
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tracing::{info, log::warn, info_span, trace_span, Instrument};
+use tracing::{info, debug, log::warn, info_span, trace_span, Instrument};
 use std::sync::{Arc};
 use std::thread::sleep;
 use std::time::Duration;
@@ -39,6 +40,7 @@ use crate::http_rpc::RpcMsg;
 
 mod http_rpc;
 mod libp2p;
+mod utils;
 
 #[derive(Clone, Debug, PartialEq, EnumString)]
 enum Topology {
@@ -70,6 +72,31 @@ pub enum TalkWire {
     Libp2p
 }
 
+// Defines settings how samples are forwarded when redundancy is enabled
+#[derive(Clone, Debug, PartialEq, EnumString)]
+pub enum ForwardMode {
+    // forward only the first message of the type
+    #[strum(serialize = "F1")]
+    ForwardOne,
+    // forward every time the message is received
+    #[strum(serialize = "FA")]
+    ForwardAll,
+}
+
+// Defines settings how samples are replicated when redundancy is enabled
+#[derive(Clone, Debug, PartialEq, EnumString)]
+pub enum ReplicatePolicy {
+    // replicate only at the dispersal initiator
+    #[strum(serialize = "R1")]
+    ReplicateOne,
+    // replicate at every step so a receiving node would also forward messages to certain number (based on --redundancy) of nodes in corresponding k-bucket
+    #[strum(serialize = "RS")]
+    ReplicateSome,
+    // replicate at every step so a receiving node would also forward messages to every node in corresponding k-bucket
+    #[strum(serialize = "RA")]
+    ReplicateAll,
+}
+
 #[derive(Clone, Parser)]
 pub struct Options {
     #[clap(long, short, default_value = "127.0.0.1")]
@@ -85,15 +112,19 @@ pub struct Options {
     #[clap(long, default_value = "discv5")]
     talk_wire: TalkWire,
     #[clap(long, short, default_value = "0")]
-    redundancy: usize
+    redundancy: usize,
+    #[clap(long, default_value = "F1")]
+    forward_mode: ForwardMode,
+    #[clap(long, default_value = "R1")]
+    replicate_mode: ReplicatePolicy
 }
 
 #[derive(Clone)]
 pub struct DASNode {
     discv5: Arc<Discv5>,
     libp2p: Libp2pService,
-    samples: Arc<RwLock<HashMap<NodeId, ()>>>,
-    handled_ids: Arc<RwLock<HashMap<Vec<u8>, ()>>>,
+    samples: Arc<RwLock<HashMap<NodeId, usize>>>,
+    handled_ids: Arc<RwLock<HashMap<Vec<u8>, usize>>>,
 }
 
 impl DASNode {
@@ -105,23 +136,6 @@ impl DASNode {
             handled_ids: Default::default()
         }
     }
-}
-
-macro_rules! clone_all {
-    ($i:ident) => {
-        let $i = $i.clone();
-    };
-    ($i:ident, $($tt:tt)*) => {
-        clone_all!($i);
-        clone_all!($($tt)*);
-    };
-    ($this:ident . $i:ident) => {
-        let $i = $this.$i.clone();
-    };
-    ($this:ident . $i:ident, $($tt:tt)*) => {
-        clone_all!($this . $i);
-        clone_all!($($tt)*);
-    };
 }
 
 fn main() {
@@ -145,6 +159,27 @@ async fn app(options: Options) -> eyre::Result<()> {
 
     let enr_to_libp2p = Arc::new(RwLock::new(HashMap::default()));
     let libp2p_to_enr = Arc::new(RwLock::new(HashMap::<PeerId, NodeId>::default()));
+
+
+    let (msg_count_tx, msg_count_rx) = mpsc::unbounded_channel::<bool>();
+    let msg_count = Arc::new(RwLock::new(0u64));
+    {
+        clone_all!(msg_count);
+        tokio::spawn(async move {
+            let mut msg_count = msg_count.write().await;
+            let mut rx = UnboundedReceiverStream::new(msg_count_rx);
+            loop {
+                if let Some(e) = rx.next().await {
+                    if e {
+                        *msg_count += 1;
+                    } else {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
 
     for (i, discv5) in discv5_servers.into_iter().enumerate() {
         let mut events_str = ReceiverStream::new(discv5.event_stream().await.unwrap());
@@ -180,9 +215,7 @@ async fn app(options: Options) -> eyre::Result<()> {
             }
         });
 
-        let addr_book = enr_to_libp2p.clone();
-        let peer_book = libp2p_to_enr.clone();
-        let node_ids = node_ids.clone();
+        clone_all!(enr_to_libp2p, libp2p_to_enr, msg_count_tx, node_ids);
         tokio::spawn(async move {
             loop {
                 select! {
@@ -190,26 +223,27 @@ async fn app(options: Options) -> eyre::Result<()> {
                         let chan = format!("{i} {}", srv.discv5.local_enr().node_id().to_string());
                         match e {
                             Discv5Event::Discovered(enr) => {
-                                info!("Stream {}: Enr discovered {}", chan, enr)
+                                debug!("Stream {}: Enr discovered {}", chan, enr)
                             }
                             Discv5Event::EnrAdded { enr, replaced: _ } => {
-                                info!("Stream {}: Enr added {}", chan, enr)
+                                debug!("Stream {}: Enr added {}", chan, enr)
                             }
                             Discv5Event::NodeInserted {
                                 node_id,
                                 replaced: _,
-                            } => info!("Stream {}: Node inserted {}", chan, node_id),
+                            } => debug!("Stream {}: Node inserted {}", chan, node_id),
                             Discv5Event::SessionEstablished(enr, _) => {
-                                info!("Stream {}: Session established {}", chan, enr)
+                                debug!("Stream {}: Session established {}", chan, enr)
                             }
                             Discv5Event::SocketUpdated(addr) => {
-                                info!("Stream {}: Socket updated {}", chan, addr)
+                                debug!("Stream {}: Socket updated {}", chan, addr)
                             }
                             Discv5Event::TalkRequest(req) => {
-                                info!("Stream {}: Talk request received", chan);
-                                clone_all!(srv, opts, addr_book, node_ids);
+                                debug!("Stream {}: Talk request received", chan);
+                                msg_count_tx.send(true);
+                                clone_all!(srv, opts, enr_to_libp2p, node_ids);
                                 tokio::spawn(async move {
-                                    let resp = handle_talk_request(req.node_id().clone(), req.body().to_vec(), srv, opts, addr_book, node_ids, i).await;
+                                    let resp = handle_talk_request(req.node_id().clone(), req.body().to_vec(), srv, opts, enr_to_libp2p, node_ids, i).await;
                                     req.respond(resp);
                                 });
                             },
@@ -217,18 +251,20 @@ async fn app(options: Options) -> eyre::Result<()> {
                     },
                     Some(m) = rpc_str.next() => match m {
                         RpcMsg::TalkReq(body, tx) => {
-                            info!("RPC {i}: Talk request received");
+                            debug!("RPC {i}: Talk request received");
+                            msg_count_tx.send(true);
                             let from = node_ids[0];
-                            clone_all!(srv, opts, addr_book, node_ids);
-                            tx.send(handle_talk_request(from, body, srv, opts, addr_book, node_ids, i).await);
+                            clone_all!(srv, opts, enr_to_libp2p, node_ids);
+                            tx.send(handle_talk_request(from, body, srv, opts, enr_to_libp2p, node_ids, i).await);
                         }
                     },
                     Some(crate::libp2p::TalkReqMsg{resp_tx, peer_id, payload}) = libp2p_msgs.next() => {
-                        info!("Libp2p {i}: Talk request received");
-                        let from = peer_book.read().await.get(&peer_id).unwrap().clone();
-                        clone_all!(srv, opts, addr_book, node_ids);
+                        debug!("Libp2p {i}: Talk request received");
+                        msg_count_tx.send(true);
+                        let from = libp2p_to_enr.read().await.get(&peer_id).unwrap().clone();
+                        clone_all!(srv, opts, enr_to_libp2p, node_ids);
                         tokio::spawn(async move {
-                            resp_tx.send(Ok(handle_talk_request(from, payload, srv, opts, addr_book, node_ids, i).await));
+                            resp_tx.send(Ok(handle_talk_request(from, payload, srv, opts, enr_to_libp2p, node_ids, i).await));
                         });
                     },
                 }
@@ -240,6 +276,9 @@ async fn app(options: Options) -> eyre::Result<()> {
         let enrs = enrs_stats;
 
         play_simulation(&options, &das_nodes, enr_to_libp2p.clone(), node_ids).await;
+        msg_count_tx.send(false).unwrap();
+        let msg_count_total = *msg_count.read().await;
+        info!("total messages sent = {msg_count_total} (communication overhead)");
 
         // let peer_count = das_nodes
         //     .iter()
@@ -409,8 +448,6 @@ pub async fn play_simulation(
                 NodeId::new(&h.finalize().try_into().unwrap())
             });
 
-            info!("number of keys={}", keys.len());
-
             let alloc = keys
                 .map(|k| (BucketIndex::new(&local_key.distance(&Key::from(k))).unwrap().get(), Key::from(k)))
                 .into_group_map();
@@ -420,18 +457,19 @@ pub async fn play_simulation(
             let mut futures = vec![];
             let mut leftover_keys = vec![];
             for (k, mut keys) in alloc.into_iter() {
-                let local_nodes = local_view.get(&k).unwrap();
-                let forward_to = local_nodes.iter().take(1 + opts.redundancy).collect::<Vec<_>>();
+                let local_nodes = local_view.get(&k).unwrap().iter();
+                let forward_to: Vec<_> = match opts.replicate_mode {
+                    ReplicatePolicy::ReplicateOne => local_nodes.take(1).collect(),
+                    ReplicatePolicy::ReplicateSome => local_nodes.take(1 + opts.redundancy).collect(),
+                    ReplicatePolicy::ReplicateAll => local_nodes.collect()
+                };
 
                 if !forward_to.is_empty() {
-                    if forward_to.len() < 1 + opts.redundancy {
-                        warn!("bucket {k} contains less nodes than needed for redundancy settings ({})", opts.redundancy);
-                    }
-
+                    let batch_id = nanoid!(8).into_bytes();
                     let msg = {
                         let mut m = vec![];
                         let mut w = BufWriter::new(&mut *m);
-                        w.write(&*nanoid!(8).into_bytes()).unwrap();
+                        w.write(&*batch_id).unwrap();
                         keys.iter().for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
                         w.buffer().to_vec()
                     };
@@ -443,7 +481,7 @@ pub async fn play_simulation(
 
                         {
                             let next_i = node_ids.iter().position(|e| *e == *next.preimage()).unwrap();
-                            info!("sending {} keys from {} ({}) to {} ({})", keys.len(), node.discv5.local_enr().node_id(), 0, next.preimage(), next_i);
+                            debug!("node {0} ({}) sends {} keys for request (id={}) to {next_i} ({})", node.discv5.local_enr().node_id(), keys.len(), hex::encode(&batch_id), next.preimage());
                         }
 
                         clone_all!(msg, keys);
@@ -457,7 +495,7 @@ pub async fn play_simulation(
                                             let mut m = vec![];
                                             let mut w = BufWriter::new(&mut *m);
                                             w.write(id.clone()).unwrap();
-                                            keys.iter().skip(i*28).take(28).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
+                                            keys.iter().skip(i*29).take(29).for_each(|k| { let _ = w.write(&k.hash.to_vec()); });
                                             w.buffer().to_vec()
                                         };
 
@@ -489,7 +527,7 @@ pub async fn play_simulation(
             {
                 let mut samples = nodes[0].samples.write().await;
                 leftover_keys.into_iter().for_each(|e| {
-                    samples.insert(e.preimage().clone(), ());
+                    samples.insert(e.preimage().clone(), 1);
                 });
             }
 
@@ -506,11 +544,15 @@ pub async fn play_simulation(
                 })
             }
 
-            println!("Keys per Node:");
-            keys_per_node.iter().filter(|(_, keys)| **keys > 0).for_each(|(n, keys)| println!("node={} ({}) keys={keys}", n.to_string(), node_ids.iter().position(|e| *e == *n).unwrap()));
-            println!("Nodes per Key:");
-            nodes_per_key.iter().for_each(|(k, nodes)| println!("key={} nodes={nodes}", k.to_string()));
-            println!("Keys total: {}", nodes_per_key.len());
+            // info!("Keys per Node:");
+            // keys_per_node.iter().filter(|(_, keys)| **keys > 0).for_each(|(n, keys)| info!("node={} ({}) keys={keys}", n.to_string(), node_ids.iter().position(|e| *e == *n).unwrap()));
+            // info!("Nodes per Key:");
+            // nodes_per_key.iter().for_each(|(k, nodes)| info!("key={} nodes={nodes}", k.to_string()));
+            // info!("Keys total: {}", nodes_per_key.len());
+
+            let mut keys_stored_total = 0usize;
+            keys_per_node.iter().for_each(|(n, keys)| keys_stored_total += *keys);
+            info!("total keys stored = {keys_stored_total} (storage overhead)");
         }
         _ => {}
     }
@@ -536,18 +578,20 @@ pub async fn handle_talk_request(
             let id = id.to_vec();
 
             {
-                info!("node ({node_idx}) attempts to get lock for request ({}) from {} ({})", hex::encode(&id), from, from_i);
+                debug!("node {node_idx} ({}) attempts to get lock for request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), hex::encode(&id), from);
                 let mut handled_ids = node.handled_ids.write().await;
-                if handled_ids.contains_key(&id) {
-                    info!("node ({node_idx}) skipped handled request id ({}) from {} ({})", hex::encode(&id), from, from_i);
+                if handled_ids.contains_key(&id) && opts.forward_mode != ForwardMode::ForwardAll {
+                    debug!("node {node_idx} ({}) skipped request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), hex::encode(&id), from);
                     return vec![]
                 } else {
-                    handled_ids.insert(id.clone(), ());
-                    info!("node ({node_idx}) is receiving request ({}) from {} ({})", hex::encode(&id), from, from_i);
+                    debug!("node {node_idx} ({}) received request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), hex::encode(&id), from);
+                    match handled_ids.entry(id.clone()) {
+                        Entry::Occupied(mut e) => e.get_mut().add_assign(1),
+                        Entry::Vacant(mut e) => { e.insert(1); }
+                    };
                     drop(handled_ids);
                 }
             }
-
 
             loop {
                 let mut b = [0;32];
@@ -571,25 +615,24 @@ pub async fn handle_talk_request(
                 .map(|k| (BucketIndex::new(&local_key.distance(&Key::from(k))).unwrap().get(), Key::from(k)))
                 .into_group_map();
 
-            // println!("Allocation:");
-            // alloc.clone().into_iter().filter(|(i, ks)| ks.len() > 0).for_each(|(i, keys)| info!(k={i}, keys=keys.len(), nodes=local_view.get(&i).unwrap().len()));
-
             let mut futures = FuturesUnordered::new();
 
             for (k, keys) in alloc.into_iter() {
                 let local_nodes = local_view.get(&k).unwrap();
-                let forward_to = local_nodes.iter().filter(|e| *e.preimage() != from).take(1 + opts.redundancy).collect::<Vec<_>>();
+                /// if **replicate-all* then a receiver node applies forwards samples to more then one node in every k-bucket it handles
+                let contacts_in_bucket = local_nodes.iter().filter(|e| *e.preimage() != from);
+                let forward_to: Vec<_> = match opts.replicate_mode {
+                    ReplicatePolicy::ReplicateOne => contacts_in_bucket.take(1).collect(),
+                    ReplicatePolicy::ReplicateSome => contacts_in_bucket.take(1 + opts.redundancy).collect(),
+                    ReplicatePolicy::ReplicateAll => contacts_in_bucket.collect()
+                };
 
                 if !forward_to.is_empty() {
-                    if forward_to.len() < 1 + opts.redundancy {
-                        warn!("bucket {k} contains less nodes than needed for redundancy settings ({})", opts.redundancy);
-                    }
-
                     for next in forward_to {
                         let enr = node.discv5.find_enr(next.preimage()).unwrap();
 
                         let next_i = node_ids.iter().position(|e| *e == *next.preimage()).unwrap();
-                        info!("sending {} keys for request ({}) from {} ({}) to {} ({})", keys.len(), hex::encode(&id), node.discv5.local_enr().node_id(), node_idx, next.preimage(), next_i);
+                        debug!("node {node_idx} ({}) sends {} keys for request (id={}) to {next_i} ({})", node.discv5.local_enr().node_id(), keys.len(), hex::encode(&id), next.preimage());
 
                         let msg = {
                             let mut m = vec![];
@@ -604,11 +647,7 @@ pub async fn handle_talk_request(
                             futures.push(async move {
                                 match opts.talk_wire {
                                     TalkWire::Discv5 => {
-                                        let x = node.discv5.talk_req(enr, b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("error making request ({}) from {node_idx} to {next_i}: {}", hex::encode(&id), e));
-                                        if x.is_ok() {
-                                            info!("success pushing {} keys for request ({}) from {} ({}) to {} ({})", keys.len(), hex::encode(&id), node.discv5.local_enr().node_id(), node_idx, next.preimage(), next_i);
-                                        }
-                                        x
+                                        node.discv5.talk_req(enr, b"bcast".to_vec(), msg).await.map_err(|e| eyre::eyre!("{e}"))
                                     }
                                     TalkWire::Libp2p => {
                                         let (peer_id, addr) = addr_book.read().await.get(&enr.node_id()).unwrap().clone();
@@ -617,14 +656,15 @@ pub async fn handle_talk_request(
                                     TalkWire::HttpRPC => {
                                         http_rpc::talk_req(enr, msg).await
                                     }
-                                }
+                                }.map_err(|e| eyre::eyre!("error making request (id={}) from {node_idx} to {next_i}: {}", hex::encode(&id), e))
                             });
                         }
                     }
                 } else {
                     let mut samples = node.samples.write().await;
-                    keys.into_iter().for_each(|e| {
-                        samples.insert(e.preimage().clone(), ());
+                    keys.into_iter().for_each(|k| match samples.entry(k.preimage().clone()) {
+                        Entry::Occupied(mut e) => e.get_mut().add_assign(1),
+                        Entry::Vacant(mut e) => { e.insert(1); }
                     });
                 }
             }
