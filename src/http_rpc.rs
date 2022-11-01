@@ -1,19 +1,18 @@
-use std::net::SocketAddr;
 use discv5::Enr;
 use enr::k256::elliptic_curve::weierstrass::add;
 use enr::NodeId;
 use eyre::anyhow;
 use futures::future::BoxFuture;
-use futures::{SinkExt};
+use futures::SinkExt;
 use rocket::http::Status;
 use rocket::response::status;
 use rocket::serde::{json::Json, Deserialize, Serialize};
 use rocket::{routes, State};
-// use surf::Url;
+use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot};
 
 pub enum RpcMsg {
-    TalkReq(Vec<u8>, oneshot::Sender<Vec<u8>>)
+    TalkReq(Vec<u8>, oneshot::Sender<Vec<u8>>),
 }
 
 struct Runtime {
@@ -21,7 +20,10 @@ struct Runtime {
 }
 
 #[post("/talk_req", data = "<req>")]
-async fn api_talk_req(state: &State<Runtime>,req: Vec<u8>) -> Result<Vec<u8>, status::Custom<String>> {
+async fn api_talk_req(
+    state: &State<Runtime>,
+    req: Vec<u8>,
+) -> Result<Vec<u8>, status::Custom<String>> {
     let (tx, rx) = oneshot::channel();
 
     state
@@ -31,7 +33,8 @@ async fn api_talk_req(state: &State<Runtime>,req: Vec<u8>) -> Result<Vec<u8>, st
         .await
         .map_err(|e| status::Custom(Status::ServiceUnavailable, e.to_string()))?;
 
-    let res = rx.await
+    let res = rx
+        .await
         .map_err(|e| status::Custom(Status::InternalServerError, e.to_string()))?;
 
     Ok(res)
@@ -47,9 +50,7 @@ pub async fn serve(to_runtime: mpsc::Sender<RpcMsg>, addr: impl Into<SocketAddr>
     config.shutdown.force = true;
 
     rocket::custom(config)
-        .manage(Runtime {
-            tx: to_runtime,
-        })
+        .manage(Runtime { tx: to_runtime })
         .mount("/", routes![api_talk_req])
         .launch()
         .await
@@ -61,7 +62,8 @@ pub async fn talk_req(enr: Enr, msg: Vec<u8>) -> eyre::Result<Vec<u8>> {
     let port = 3000 + (enr.udp4().unwrap() - 9000); // todo: dirty deterministic hack, should be config instead
     let client = reqwest::Client::new();
 
-    let mut resp = client.post(format!("http://{addr}:{port}/talk_req"))
+    let mut resp = client
+        .post(format!("http://{addr}:{port}/talk_req"))
         .body(msg)
         .send()
         .await

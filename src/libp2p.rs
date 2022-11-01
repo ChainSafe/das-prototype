@@ -1,29 +1,34 @@
-use futures::prelude::*;
-use std::{io, iter};
-use std::collections::{HashMap, VecDeque};
-use std::collections::hash_map::Entry;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::Duration;
 use discv5::Enr;
+use futures::prelude::*;
 use futures::stream::FuturesUnordered;
-use libp2p::{identity, mplex, Multiaddr, noise, PeerId, Swarm, Transport};
 use libp2p::core::transport::upgrade;
 use libp2p::identity::Keypair;
 use libp2p::noise::NoiseConfig;
-use libp2p::swarm::{NetworkBehaviour, NetworkBehaviourAction, NetworkBehaviourEventProcess, PollParameters, SwarmEvent};
-use libp2p::NetworkBehaviour;
-use libp2p::request_response::{ProtocolSupport, RequestId, RequestResponse, RequestResponseCodec, RequestResponseConfig, RequestResponseEvent, RequestResponseMessage, ResponseChannel};
+use libp2p::request_response::{
+    ProtocolSupport, RequestId, RequestResponse, RequestResponseCodec, RequestResponseConfig,
+    RequestResponseEvent, RequestResponseMessage, ResponseChannel,
+};
+use libp2p::swarm::{
+    NetworkBehaviour, NetworkBehaviourAction, NetworkBehaviourEventProcess, PollParameters,
+    SwarmEvent,
+};
 use libp2p::tcp::TcpConfig;
+use libp2p::NetworkBehaviour;
+use libp2p::{identity, mplex, noise, Multiaddr, PeerId, Swarm, Transport};
 use rocket::form::FromForm;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use std::{io, iter};
 use tokio::net::tcp;
 use tokio::select;
-use tokio::sync::{mpsc, oneshot};
-use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot::Sender;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
-use tracing::{info, debug, log::warn};
-
+use tracing::{debug, info, log::warn};
 
 const PROTOCOL_ID: &str = "/das/0.1.0";
 
@@ -50,7 +55,7 @@ pub enum NetworkMessage {
         peer_id: PeerId,
         addr: Multiaddr,
         message: Vec<u8>,
-        resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>
+        resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
     },
 }
 
@@ -58,7 +63,7 @@ pub enum NetworkMessage {
 pub struct TalkReqMsg {
     pub peer_id: PeerId,
     pub payload: Vec<u8>,
-    pub resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>
+    pub resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
 }
 
 impl Libp2pDaemon {
@@ -66,7 +71,11 @@ impl Libp2pDaemon {
         keypair: Keypair,
         addr: Multiaddr,
         node_index: usize,
-    ) -> (Libp2pDaemon, mpsc::UnboundedReceiver<TalkReqMsg>, Libp2pService) {
+    ) -> (
+        Libp2pDaemon,
+        mpsc::UnboundedReceiver<TalkReqMsg>,
+        Libp2pService,
+    ) {
         let local_peer_id = PeerId::from(keypair.public());
 
         let transport = {
@@ -82,7 +91,11 @@ impl Libp2pDaemon {
         };
 
         let (message_sink, message_chan) = mpsc::unbounded_channel();
-        let mut swarm = Swarm::new(transport, Behaviour::new(message_sink, node_index), local_peer_id);
+        let mut swarm = Swarm::new(
+            transport,
+            Behaviour::new(message_sink, node_index),
+            local_peer_id,
+        );
 
         // Listen on the addresses.
         if let Err(err) = swarm.listen_on(addr) {
@@ -167,16 +180,20 @@ impl Libp2pService {
                 peer_id: peer_id.clone(),
                 addr: addr.clone(),
                 message: payload,
-                resp_tx: tx
-            }).map_err(|e| eyre::eyre!("{e}"))?;
+                resp_tx: tx,
+            })
+            .map_err(|e| eyre::eyre!("{e}"))?;
 
         rx.await.unwrap()
     }
 }
 
-
 #[derive(NetworkBehaviour)]
-#[behaviour(out_event = "BehaviourEvent", poll_method = "poll", event_process = true)]
+#[behaviour(
+    out_event = "BehaviourEvent",
+    poll_method = "poll",
+    event_process = true
+)]
 pub(crate) struct Behaviour {
     req_resp: RequestResponse<GenericCodec>,
 
@@ -187,12 +204,11 @@ pub(crate) struct Behaviour {
     message_sink: mpsc::UnboundedSender<TalkReqMsg>,
 
     #[behaviour(ignore)]
-    pending_requests: HashMap<
-        RequestId,
-        Option<oneshot::Sender<eyre::Result<Vec<u8>>>>>,
+    pending_requests: HashMap<RequestId, Option<oneshot::Sender<eyre::Result<Vec<u8>>>>>,
 
     #[behaviour(ignore)]
-    pending_responses: FuturesUnordered<Pin<Box<dyn Future<Output = Option<RequestProcessingOutcome>> + Send>>>,
+    pending_responses:
+        FuturesUnordered<Pin<Box<dyn Future<Output = Option<RequestProcessingOutcome>> + Send>>>,
 
     #[behaviour(ignore)]
     node_index: usize,
@@ -213,21 +229,29 @@ pub(crate) enum BehaviourEvent {
 impl Behaviour {
     pub fn new(message_sink: mpsc::UnboundedSender<TalkReqMsg>, node_index: usize) -> Self {
         Self {
-            req_resp: RequestResponse::new(GenericCodec {
-                max_request_size: 100000,
-                max_response_size: 100000,
-            }, iter::once((PROTOCOL_ID.as_bytes().to_vec(), ProtocolSupport::Full)),
-                                           RequestResponseConfig::default(),
+            req_resp: RequestResponse::new(
+                GenericCodec {
+                    max_request_size: 100000,
+                    max_response_size: 100000,
+                },
+                iter::once((PROTOCOL_ID.as_bytes().to_vec(), ProtocolSupport::Full)),
+                RequestResponseConfig::default(),
             ),
             events: Default::default(),
             message_sink,
             pending_requests: Default::default(),
             pending_responses: Default::default(),
-            node_index
+            node_index,
         }
     }
 
-    pub fn send_request(&mut self, peer_id: PeerId, addr: Multiaddr, message: Vec<u8>, resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>) {
+    pub fn send_request(
+        &mut self,
+        peer_id: PeerId,
+        addr: Multiaddr,
+        message: Vec<u8>,
+        resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
+    ) {
         self.req_resp.add_address(&peer_id, addr);
         let req_id = self.req_resp.send_request(&peer_id, message);
         self.pending_requests.insert(req_id, Some(resp_tx));
@@ -252,9 +276,7 @@ impl Behaviour {
                 // later on reported as a `InboundFailure::Omission`.
                 None => break,
             };
-            if let Err(_) = self
-                .req_resp
-                .send_response(inner_channel, response) {
+            if let Err(_) = self.req_resp.send_response(inner_channel, response) {
                 warn!("failed to send response");
             }
         }
@@ -267,19 +289,25 @@ impl Behaviour {
     }
 }
 
-impl NetworkBehaviourEventProcess<RequestResponseEvent<Vec<u8>, Result<Vec<u8>, ()>>> for Behaviour {
+impl NetworkBehaviourEventProcess<RequestResponseEvent<Vec<u8>, Result<Vec<u8>, ()>>>
+    for Behaviour
+{
     fn inject_event(&mut self, event: RequestResponseEvent<Vec<u8>, Result<Vec<u8>, ()>>) {
         let node_index = self.node_index;
         match event {
             RequestResponseEvent::Message { peer, message } => {
                 match message {
-                    RequestResponseMessage::Request { request, channel, .. } => {
+                    RequestResponseMessage::Request {
+                        request, channel, ..
+                    } => {
                         let (tx, rx) = oneshot::channel();
-                        self.message_sink.send(TalkReqMsg{
-                            peer_id: peer,
-                            payload: request,
-                            resp_tx: tx
-                        }).unwrap();
+                        self.message_sink
+                            .send(TalkReqMsg {
+                                peer_id: peer,
+                                payload: request,
+                                resp_tx: tx,
+                            })
+                            .unwrap();
 
                         self.pending_responses.push(Box::pin(async move {
                             rx.await
@@ -290,24 +318,33 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<Vec<u8>, Result<Vec<u8>, 
                                 .ok()
                         }));
                     }
-                    RequestResponseMessage::Response { request_id, response } => {
-                        match self.pending_requests.entry(request_id) {
-                            Entry::Occupied(e) => {
-                                if let Some(tx) = e.remove() {
-                                    tx.send(response.map_err(|_| eyre::eyre!("got error resp"))).unwrap();
-                                }
+                    RequestResponseMessage::Response {
+                        request_id,
+                        response,
+                    } => match self.pending_requests.entry(request_id) {
+                        Entry::Occupied(e) => {
+                            if let Some(tx) = e.remove() {
+                                tx.send(response.map_err(|_| eyre::eyre!("got error resp")))
+                                    .unwrap();
                             }
-                            Entry::Vacant(_) => panic!("unknown request_id")
                         }
-                    }
+                        Entry::Vacant(_) => panic!("unknown request_id"),
+                    },
                 }
-                self.events.push_back(BehaviourEvent::InboundMessage {peer});
+                self.events
+                    .push_back(BehaviourEvent::InboundMessage { peer });
             }
             RequestResponseEvent::OutboundFailure { peer, error, .. } => {
-                debug!(libp2p_node_idx=node_index, "OutboundFailure {:?}: {}", peer, error);
+                debug!(
+                    libp2p_node_idx = node_index,
+                    "OutboundFailure {:?}: {}", peer, error
+                );
             }
             RequestResponseEvent::InboundFailure { peer, error, .. } => {
-                debug!(libp2p_node_idx=node_index, "InboundFailure {:?}: {}", peer, error);
+                debug!(
+                    libp2p_node_idx = node_index,
+                    "InboundFailure {:?}: {}", peer, error
+                );
             }
             RequestResponseEvent::ResponseSent { .. } => {}
         }
@@ -332,8 +369,8 @@ impl RequestResponseCodec for GenericCodec {
         _: &Self::Protocol,
         mut io: &mut T,
     ) -> io::Result<Self::Request>
-        where
-            T: AsyncRead + Unpin + Send,
+    where
+        T: AsyncRead + Unpin + Send,
     {
         // Read the length.
         let length = unsigned_varint::aio::read_usize(&mut io)
@@ -362,17 +399,17 @@ impl RequestResponseCodec for GenericCodec {
         _: &Self::Protocol,
         mut io: &mut T,
     ) -> io::Result<Self::Response>
-        where
-            T: AsyncRead + Unpin + Send,
+    where
+        T: AsyncRead + Unpin + Send,
     {
         // Read the length.
         let length = match unsigned_varint::aio::read_usize(&mut io).await {
             Ok(l) => l,
             Err(unsigned_varint::io::ReadError::Io(err))
-            if matches!(err.kind(), io::ErrorKind::UnexpectedEof) =>
-                {
-                    return Ok(Err(()));
-                }
+                if matches!(err.kind(), io::ErrorKind::UnexpectedEof) =>
+            {
+                return Ok(Err(()));
+            }
             Err(err) => return Err(io::Error::new(io::ErrorKind::InvalidInput, err)),
         };
 
@@ -398,16 +435,13 @@ impl RequestResponseCodec for GenericCodec {
         io: &mut T,
         req: Self::Request,
     ) -> io::Result<()>
-        where
-            T: AsyncWrite + Unpin + Send,
+    where
+        T: AsyncWrite + Unpin + Send,
     {
         // Write the length.
         {
             let mut buffer = unsigned_varint::encode::usize_buffer();
-            io.write_all(unsigned_varint::encode::usize(
-                req.len(),
-                &mut buffer,
-            ))
+            io.write_all(unsigned_varint::encode::usize(req.len(), &mut buffer))
                 .await?;
         }
 
@@ -424,8 +458,8 @@ impl RequestResponseCodec for GenericCodec {
         io: &mut T,
         res: Self::Response,
     ) -> io::Result<()>
-        where
-            T: AsyncWrite + Unpin + Send,
+    where
+        T: AsyncWrite + Unpin + Send,
     {
         // If `res` is an `Err`, we jump to closing the substream without writing anything on it.
         if let Ok(res) = res {
