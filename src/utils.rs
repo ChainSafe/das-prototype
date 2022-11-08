@@ -1,5 +1,7 @@
 use std::iter;
 use eyre::eyre;
+use tokio::sync::oneshot;
+
 #[macro_export]
 macro_rules! clone_all {
     ($i:ident) => {
@@ -18,6 +20,12 @@ macro_rules! clone_all {
     };
 }
 
+#[derive(Debug)]
+pub enum MsgCountCmd {
+    Reset,
+    Get(oneshot::Sender<u64>),
+    Increment,
+}
 
 pub fn encode_result_for_discv5(r: eyre::Result<Vec<u8>>) -> Vec<u8> {
     match r {
