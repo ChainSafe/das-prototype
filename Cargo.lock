@@ -948,6 +948,7 @@ name = "das-tests"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "clap",
  "cli-batteries",
  "discv5",

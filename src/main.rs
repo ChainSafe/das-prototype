@@ -21,13 +21,15 @@ use sha3::{Digest, Keccak256};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::iter;
+use std::{fs, iter};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::AddAssign;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+use chrono::{DateTime, Utc};
 use eyre::eyre;
 use strum::EnumString;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -106,6 +108,10 @@ pub struct Options {
     talk_wire: TalkWire,
     #[clap(long="timeout", default_value = "1")]
     lookup_timeout: u64,
+    #[clap(long, short, default_value = "./data")]
+    cache_dir: String,
+    #[clap(long, default_value = "new")]
+    snapshot: String,
 
     #[command(subcommand)]
     simulation_case: SimulationCase,
@@ -328,12 +334,46 @@ async fn construct_and_start(
     node_count: usize,
 ) -> Vec<Discv5> {
     let mut discv5_servers = Vec::with_capacity(node_count);
+
+    let snapshot_dir = match &*opts.snapshot {
+        "new" => {
+            let snap_time: DateTime<Utc> = SystemTime::now().into();
+            let snap_dir = PathBuf::from(&opts.cache_dir).join(snap_time.format("%Y-%m-%d-%T").to_string());
+            fs::create_dir_all(&snap_dir).unwrap();
+            snap_dir
+        },
+        "last" => {
+            let mut paths: Vec<_> = fs::read_dir(&opts.cache_dir).unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            paths.sort_by_key(|dir| dir.metadata().unwrap().created().unwrap());
+            paths.last().unwrap().path()
+        }
+        snap => {
+            PathBuf::from(&opts.cache_dir).join(snap)
+        }
+    };
+
+    info!("snapshot: {}", snapshot_dir.to_str().unwrap());
+
     for i in 0..node_count {
         let listen_addr = format!("{}:{}", listen_ip, port_start + i)
             .parse::<SocketAddr>()
             .unwrap();
-        println!("{}", listen_addr);
-        let enr_key = CombinedKey::generate_secp256k1();
+        debug!("{}", listen_addr);
+
+        let enr_key = match &*opts.snapshot {
+            "new" => {
+                let key = CombinedKey::generate_secp256k1();
+                fs::write(snapshot_dir.join(format!("{i}.pem")), key.encode()).unwrap();
+                key
+            },
+            _ => {
+                let mut key_bytes = fs::read(snapshot_dir.join(format!("{i}.pem"))).unwrap();
+                CombinedKey::secp256k1_from_bytes(&mut key_bytes).unwrap()
+            }
+        };
+
         let enr = {
             let mut builder = enr::EnrBuilder::new("v4");
             // TODO: Revisit this when we are not running locally
@@ -349,22 +389,25 @@ async fn construct_and_start(
             builder.udp4(port_start as u16 + i as u16);
             builder.build(&enr_key).unwrap()
         };
-        println!("Node Id: {}", enr.node_id());
+        debug!("Node Id: {}", enr.node_id());
         if enr.udp4_socket().is_some() {
-            println!("Base64 ENR: {}", enr.to_base64());
-            println!(
+            debug!("Base64 ENR: {}", enr.to_base64());
+            debug!(
                 "IP: {}, UDP_PORT:{}",
                 enr.ip4().unwrap(),
                 enr.udp4().unwrap()
             );
         } else {
-            println!("ENR is not printed as no IP:PORT was specified");
+            warn!("ENR is not printed as no IP:PORT was specified");
         }
+
         // default configuration
         let mut config_builder = Discv5ConfigBuilder::default();
         config_builder.request_retries(10);
         config_builder.filter_max_nodes_per_ip(None);
         config_builder.request_timeout(Duration::from_secs(opts.lookup_timeout));
+        config_builder.query_timeout(Duration::from_secs(30));
+
         let config = config_builder.build();
 
         // construct the discv5 server
@@ -447,21 +490,10 @@ pub async fn play_simulation(
                 NodeId::new(&h.finalize().try_into().unwrap())
             });
 
-            disseminate_samples(keys.clone(), opts, &args, nodes, addr_book.clone(), &node_ids).await;
-
-            let mut keys_per_node = HashMap::new();
-            let mut nodes_per_key = HashMap::<_, usize>::new();
-
-            for n in nodes {
-                let samples = n.samples.read().await;
-                keys_per_node.insert(n.discv5.local_enr().node_id(), samples.len());
-                samples.keys().for_each(|k| {
-                    nodes_per_key
-                        .entry(k.clone())
-                        .and_modify(|e| e.add_assign(1))
-                        .or_insert(1);
-                })
-            }
+            let (
+                keys_per_node,
+                nodes_per_key
+            ) = disseminate_samples(keys.clone(), opts, &args, nodes, addr_book.clone(), &node_ids).await;
 
             debug!("Keys per Node:");
             keys_per_node
@@ -477,16 +509,14 @@ pub async fn play_simulation(
             debug!("Nodes per Key:");
             nodes_per_key
                 .iter()
-                .for_each(|(k, nodes)| debug!("key={} nodes={nodes}", k.to_string()));
+                .for_each(|(k, nodes)| debug!("key={} nodes={}", k.to_string(), nodes.len()));
             debug!("Keys total: {}", nodes_per_key.len());
 
             for k in keys {
                 if !nodes_per_key.contains_key(&k) {
-                    println!("missing key: {}", k.to_string());
+                    warn!("missing key: {}", k.to_string());
                 }
             }
-
-            let unique_keys_stored = nodes_per_key.len();
 
             let mut keys_stored_total = 0usize;
             keys_per_node
@@ -494,6 +524,7 @@ pub async fn play_simulation(
                 .for_each(|(n, keys)| keys_stored_total += *keys);
             info!("total keys stored = {keys_stored_total} (storage overhead)");
 
+            let unique_keys_stored = nodes_per_key.len();
             assert_eq!(unique_keys_stored, args.number_of_samples);
 
             let msg_count_total = {
@@ -512,7 +543,10 @@ pub async fn play_simulation(
                 })
                 .collect::<Vec<_>>();
 
-            disseminate_samples(
+            let (
+                keys_per_node,
+                nodes_per_key
+            ) = disseminate_samples(
                 keys.clone().into_iter(),
                 opts,
                 &args.dissemination_args,
@@ -522,17 +556,21 @@ pub async fn play_simulation(
             )
             .await;
 
-            let mut nodes_per_key = HashMap::<_, Vec<NodeId>>::new();
+            let mut keys_stored_total = 0usize;
+            keys_per_node
+                .iter()
+                .for_each(|(n, keys)| keys_stored_total += *keys);
+            info!("total keys stored = {keys_stored_total} (storage overhead)");
 
-            for n in nodes {
-                let samples = n.samples.read().await;
-                samples.keys().for_each(|k| {
-                    nodes_per_key
-                        .entry(k.clone())
-                        .and_modify(|e| e.push(n.discv5.local_enr().node_id()))
-                        .or_insert(vec![n.discv5.local_enr().node_id()]);
-                })
-            }
+            let unique_keys_stored = nodes_per_key.len();
+            assert_eq!(unique_keys_stored, args.dissemination_args.number_of_samples);
+
+            let msg_count_total = {
+                let (tx, rx) = oneshot::channel();
+                msg_counter.send(MsgCountCmd::Get(tx)).unwrap();
+                rx.await.unwrap()
+            };
+            info!("total messages sent = {msg_count_total} (communication overhead)");
 
             msg_counter.send(MsgCountCmd::Reset).unwrap();
 
@@ -667,7 +705,10 @@ async fn disseminate_samples(
     nodes: &Vec<DASNode>,
     addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
     node_ids: &Vec<NodeId>,
-) {
+) -> (
+    HashMap<NodeId, usize>,
+    HashMap::<NodeId, Vec<NodeId>>
+){
     let node = nodes[0].clone();
     let local_node_id = node.discv5.local_enr().node_id();
 
@@ -741,7 +782,7 @@ async fn disseminate_samples(
     let mut futures = vec![];
     for (next, mut keys) in alloc.into_iter() {
         if next == local_node_id {
-            warn!("[str] no peers to forward {} keys to, saved locally", keys.len());
+            warn!("no peers to forward {} keys to, saved locally", keys.len());
 
             let mut samples = node.samples.write().await;
             keys.clone().into_iter()
@@ -824,6 +865,23 @@ async fn disseminate_samples(
     futures::future::join_all(futures)
         .instrument(info_span!("bucket-cast"))
         .await;
+
+    let mut keys_per_node = HashMap::new();
+    let mut nodes_per_key = HashMap::<_, Vec<NodeId>>::new();
+
+    for n in nodes {
+        let samples = n.samples.read().await;
+        samples.keys().for_each(|k| {
+            keys_per_node.insert(n.discv5.local_enr().node_id(), samples.len());
+
+            nodes_per_key
+                .entry(k.clone())
+                .and_modify(|e| e.push(n.discv5.local_enr().node_id()))
+                .or_insert(vec![n.discv5.local_enr().node_id()]);
+        })
+    }
+
+    return (keys_per_node, nodes_per_key)
 }
 
 async fn handle_dissemination_request(
@@ -1023,7 +1081,7 @@ async fn handle_sampling_request(
 
     let mut samples = node.samples.read().await;
 
-    info!("receive sampling request, have {} samples total, distance to requested key={:?}", samples.len(), Key::from(node.discv5.local_enr().node_id()).distance(&Key::from(key)));
+    debug!("receive sampling request, have {} samples total, distance to requested key={:?}", samples.len(), Key::from(node.discv5.local_enr().node_id()).distance(&Key::from(key)));
 
     if let Some(_) = samples.get(&key) {
         Ok(b"yep".to_vec())
@@ -1040,7 +1098,7 @@ async fn _handle_sampling_request(
 ) -> Option<Vec<u8>> {
     let mut samples = node.samples.read().await;
 
-    info!("receive sampling request, have {} samples total, distance to requested key={:?}, have requested key = {}", samples.len(), Key::from(node.discv5.local_enr().node_id()).log2_distance(&Key::from(key.clone())), samples.contains_key(key));
+    debug!("receive sampling request, have {} samples total, distance to requested key={:?}, have requested key = {}", samples.len(), Key::from(node.discv5.local_enr().node_id()).log2_distance(&Key::from(key.clone())), samples.contains_key(key));
 
     samples.get(key).map(|e| b"yep".to_vec())
 }
