@@ -16,6 +16,7 @@ use libp2p::tcp::TcpConfig;
 use libp2p::NetworkBehaviour;
 use libp2p::{identity, mplex, noise, Multiaddr, PeerId, Swarm, Transport};
 use rocket::form::FromForm;
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
@@ -54,7 +55,8 @@ pub enum NetworkMessage {
     RequestResponse {
         peer_id: PeerId,
         addr: Multiaddr,
-        message: Vec<u8>,
+        protocol: Vec<u8>,
+        payload: Vec<u8>,
         resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
     },
 }
@@ -62,6 +64,7 @@ pub enum NetworkMessage {
 #[derive(Debug)]
 pub struct TalkReqMsg {
     pub peer_id: PeerId,
+    pub protocol: Vec<u8>,
     pub payload: Vec<u8>,
     pub resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
 }
@@ -153,10 +156,11 @@ impl Libp2pDaemon {
                             NetworkMessage::RequestResponse {
                                 peer_id,
                                 addr,
-                                message,
+                                protocol,
+                                payload,
                                 resp_tx,
                             } => {
-                                behaviour.send_request(peer_id, addr, message, resp_tx);
+                                behaviour.send_request(peer_id, addr, protocol, payload, resp_tx);
                             }
                         }
                     }
@@ -172,6 +176,7 @@ impl Libp2pService {
         &self,
         peer_id: &PeerId,
         addr: &Multiaddr,
+        protocol: &[u8],
         payload: Vec<u8>,
     ) -> eyre::Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
@@ -179,7 +184,8 @@ impl Libp2pService {
             .send(NetworkMessage::RequestResponse {
                 peer_id: peer_id.clone(),
                 addr: addr.clone(),
-                message: payload,
+                protocol: protocol.to_vec(),
+                payload,
                 resp_tx: tx,
             })
             .map_err(|e| eyre::eyre!("{e}"))?;
@@ -249,11 +255,14 @@ impl Behaviour {
         &mut self,
         peer_id: PeerId,
         addr: Multiaddr,
-        message: Vec<u8>,
+        protocol: Vec<u8>,
+        payload: Vec<u8>,
         resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
     ) {
         self.req_resp.add_address(&peer_id, addr);
-        let req_id = self.req_resp.send_request(&peer_id, message);
+        let req_id = self
+            .req_resp
+            .send_request(&peer_id, TalkRequest { protocol, payload });
         self.pending_requests.insert(req_id, Some(resp_tx));
     }
 
@@ -289,10 +298,10 @@ impl Behaviour {
     }
 }
 
-impl NetworkBehaviourEventProcess<RequestResponseEvent<Vec<u8>, Result<Vec<u8>, ()>>>
+impl NetworkBehaviourEventProcess<RequestResponseEvent<TalkRequest, Result<Vec<u8>, ()>>>
     for Behaviour
 {
-    fn inject_event(&mut self, event: RequestResponseEvent<Vec<u8>, Result<Vec<u8>, ()>>) {
+    fn inject_event(&mut self, event: RequestResponseEvent<TalkRequest, Result<Vec<u8>, ()>>) {
         let node_index = self.node_index;
         match event {
             RequestResponseEvent::Message { peer, message } => {
@@ -304,7 +313,8 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<Vec<u8>, Result<Vec<u8>, 
                         self.message_sink
                             .send(TalkReqMsg {
                                 peer_id: peer,
-                                payload: request,
+                                protocol: request.protocol,
+                                payload: request.payload,
                                 resp_tx: tx,
                             })
                             .unwrap();
@@ -351,6 +361,12 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<Vec<u8>, Result<Vec<u8>, 
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct TalkRequest {
+    pub protocol: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct GenericCodec {
@@ -361,7 +377,7 @@ pub struct GenericCodec {
 #[async_trait::async_trait]
 impl RequestResponseCodec for GenericCodec {
     type Protocol = Vec<u8>;
-    type Request = Vec<u8>;
+    type Request = TalkRequest;
     type Response = Result<Vec<u8>, ()>;
 
     async fn read_request<T>(
@@ -372,26 +388,33 @@ impl RequestResponseCodec for GenericCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        // Read the length.
-        let length = unsigned_varint::aio::read_usize(&mut io)
+        let protocol_length = unsigned_varint::aio::read_usize(&mut io)
             .await
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
-        if length > usize::try_from(self.max_request_size).unwrap_or(usize::MAX) {
+        let mut protocol = vec![0; protocol_length];
+        io.read_exact(&mut protocol).await?;
+
+        // Read the length.
+        let payload_length = unsigned_varint::aio::read_usize(&mut io)
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
+        if payload_length > usize::try_from(self.max_request_size).unwrap_or(usize::MAX) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "Request size exceeds limit: {} > {}",
-                    length, self.max_request_size
+                    payload_length, self.max_request_size
                 ),
             ));
         }
 
         // Read the payload.
-        let mut buffer = vec![0; length];
-        io.read_exact(&mut buffer).await?;
+        let mut payload = vec![0; payload_length];
+        io.read_exact(&mut payload).await?;
 
-        Ok(buffer)
+        Ok(TalkRequest { protocol, payload })
     }
 
     async fn read_response<T>(
@@ -438,15 +461,31 @@ impl RequestResponseCodec for GenericCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        // Write the length.
+        // Write the protocol_length.
         {
             let mut buffer = unsigned_varint::encode::usize_buffer();
-            io.write_all(unsigned_varint::encode::usize(req.len(), &mut buffer))
-                .await?;
+            io.write_all(unsigned_varint::encode::usize(
+                req.protocol.len(),
+                &mut buffer,
+            ))
+            .await?;
+        }
+
+        // Write protocol.
+        io.write_all(&req.protocol).await?;
+
+        // Write the payload_length.
+        {
+            let mut buffer = unsigned_varint::encode::usize_buffer();
+            io.write_all(unsigned_varint::encode::usize(
+                req.payload.len(),
+                &mut buffer,
+            ))
+            .await?;
         }
 
         // Write the payload.
-        io.write_all(&req).await?;
+        io.write_all(&req.payload).await?;
 
         io.close().await?;
         Ok(())

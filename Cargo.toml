@@ -28,6 +28,9 @@ rand = "0.8"
 sha3 = "0.10"
 nanoid = "0.4.0"
 
+chrono = "0.4.22"
+byteorder = "1.4.3"
+
 libp2p = { version = "0.40.0" }
 unsigned-varint = "0.7.1"
 async-trait = "0.1.58"
