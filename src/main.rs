@@ -16,12 +16,13 @@ use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{pin_mut, FutureExt, AsyncWriteExt};
 use itertools::Itertools;
 use nanoid::nanoid;
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, SeedableRng};
 use sha3::{Digest, Keccak256};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::{fs, iter};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::AddAssign;
 use std::path::PathBuf;
@@ -29,8 +30,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
+use byteorder::{BigEndian, ReadBytesExt};
 use chrono::{DateTime, Utc};
+use discv5::error::FindValueError;
 use eyre::eyre;
+use rand::prelude::StdRng;
 use strum::EnumString;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -106,8 +110,8 @@ pub struct Options {
     topology: Topology,
     #[clap(long, default_value = "discv5")]
     talk_wire: TalkWire,
-    #[clap(long="timeout", default_value = "1")]
-    lookup_timeout: u64,
+    #[clap(long="timeout", default_value = "3")]
+    request_timeout: u64,
     #[clap(long, short, default_value = "./data")]
     cache_dir: String,
     #[clap(long, default_value = "new")]
@@ -147,6 +151,9 @@ struct SamplingArgs {
 
     #[clap(long, short)]
     validators_number: usize,
+
+    #[clap(long, short, default_value = "15")]
+    parallelism: usize,
 }
 
 #[derive(Clone)]
@@ -284,9 +291,10 @@ async fn app(options: Options) -> eyre::Result<()> {
                                 });
                             },
                             Discv5Event::FindValue(req) => {
-                                debug!("Stream {}: FindValue request received", chan);
+                                debug!("Stream {}: FindValue request received with id {}", chan, req.id());
                                 msg_counter.send(MsgCountCmd::Increment);
                                 clone_all!(srv, opts, enr_to_libp2p, node_ids);
+                                // TODO: trace request by id
                                 tokio::spawn(async move {
                                     let resp = _handle_sampling_request(req.node_id().clone(), req.key(), &srv, &opts).await;
                                     req.respond(resp);
@@ -405,8 +413,8 @@ async fn construct_and_start(
         let mut config_builder = Discv5ConfigBuilder::default();
         config_builder.request_retries(10);
         config_builder.filter_max_nodes_per_ip(None);
-        config_builder.request_timeout(Duration::from_secs(opts.lookup_timeout));
-        config_builder.query_timeout(Duration::from_secs(30));
+        config_builder.request_timeout(Duration::from_secs(opts.request_timeout));
+        config_builder.query_timeout(Duration::from_secs(60));
 
         let config = config_builder.build();
 
@@ -447,7 +455,14 @@ pub fn set_topology(opts: &Options, mut discv5_servers: Vec<Discv5>) -> Vec<Disc
             }
         }
         Topology::Uniform => {
-            let mut rng = rand::thread_rng();
+            let topology_seed = {
+                let f = get_snapshot_file(&opts, "topology_seed");
+                let seed = fs::read(&f).map_or(rand::thread_rng().gen::<u64>(), |b| b.as_slice().read_u64::<BigEndian>().unwrap());
+                fs::write(&f, seed.to_be_bytes()).unwrap();
+                seed
+            };
+
+            let mut rng = StdRng::seed_from_u64(topology_seed);
             for (i, s) in discv5_servers.iter().enumerate() {
                 let mut n = 128;
                 while n != 0 {
@@ -554,7 +569,7 @@ pub async fn play_simulation(
                 addr_book.clone(),
                 &node_ids,
             )
-            .await;
+                .await;
 
             let mut keys_stored_total = 0usize;
             keys_per_node
@@ -574,84 +589,95 @@ pub async fn play_simulation(
 
             msg_counter.send(MsgCountCmd::Reset).unwrap();
 
+            let validators_seed = {
+                let f = get_snapshot_file(&opts, "validators_seed");
+                let seed = fs::read(&f).map_or(rand::thread_rng().gen::<u64>(), |b| b.as_slice().read_u64::<BigEndian>().unwrap());
+                fs::write(&f, seed.to_be_bytes()).unwrap();
+                seed
+            };
+            let mut rng = StdRng::seed_from_u64(validators_seed);
+
             let validators =
-                rand::seq::index::sample(&mut thread_rng(), nodes.len(), args.validators_number)
+                rand::seq::index::sample(&mut rng, nodes.len(), args.validators_number)
                     .iter()
                     .map(|i| nodes[i].clone())
                     .collect::<Vec<_>>();
 
             let mut futures = vec![];
 
-            for validator in validators {
+            for (i, validator) in validators.into_iter().enumerate() {
+                let validator_node_id = validator.discv5.local_enr().node_id();
                 let samples = rand::seq::index::sample(
                     &mut thread_rng(),
                     keys.len(),
                     args.samples_per_validator,
                 )
-                .iter()
-                .map(|i| (i, keys[i]))
-                .collect_vec();
+                    .iter()
+                    .map(|i| (i, keys[i]))
+                    .collect_vec();
 
-                for (i, sample) in samples {
-                    clone_all!(validator, addr_book, node_ids, nodes_per_key);
+                let parallelism = args.parallelism;
 
-                    futures.push(async move {
-                        match validator.discv5.find_value(sample).await {
-                            Ok(res) => Some(res),
-                            Err(found_enrs) => {
-                                error!("node {} fail requesting sample {i} ({})", validator.discv5.local_enr().node_id(), sample);
-                                let host_nodes = nodes_per_key.get(&sample).unwrap().clone();
-                                let local_info = host_nodes.iter().map(|e| (e.to_string(), Key::from(e.clone()).log2_distance(&Key::from(sample.clone())))).collect_vec();
-                                let search_info = found_enrs.iter().map(|e| (e.node_id().to_string(), Key::from(e.node_id().clone()).log2_distance(&Key::from(sample.clone())))).collect_vec();
-                                info!("missing sample is stored in {:?}, visited nodes: {:?}", local_info, search_info);
+                clone_all!(node_ids, nodes_per_key);
 
-                                None
+                futures.push(async move {
+                    let mut futures = FuturesUnordered::new();
+                    let mut samples = samples;
+                    let mut num_waiting = 0usize;
+                    let mut num_success = 0usize;
+
+                    loop {
+                        if num_waiting < parallelism {
+                            if let Some((j, sample_key)) = samples.pop() {
+                                num_waiting += 1;
+                                clone_all!(validator, node_ids, nodes_per_key);
+                                futures.push(async move {
+                                    match validator.discv5.find_value(sample_key).await {
+                                        Ok(res) => Some((j, sample_key.clone(), res)),
+                                        Err(e) => match e {
+                                            FindValueError::RequestError(e) => {
+                                                error!("node {i} ({validator_node_id}) fail requesting sample {j} ({sample_key}): {e}");
+                                                None
+                                            }
+                                            FindValueError::RequestErrorWithEnrs((re, found_enrs)) => {
+                                                error!("node {i} ({validator_node_id}) fail requesting sample {j} ({sample_key}): {re}");
+
+                                                let host_nodes = nodes_per_key.get(&sample_key).unwrap().clone();
+                                                let local_info = host_nodes.iter().map(|e| (e.to_string(), Key::from(e.clone()).log2_distance(&Key::from(sample_key.clone())))).collect_vec();
+                                                let search_info = found_enrs.iter().map(|e| (e.node_id().to_string(), Key::from(e.node_id().clone()).log2_distance(&Key::from(sample_key.clone())))).collect_vec();
+                                                info!("missing sample is stored in {:?}, visited nodes: {:?}", local_info, search_info);
+                                                None
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         }
-                    });
 
-                    // for enr in found {
-                    //     let node_id = enr.node_id();
-                    //     let node_idx = node_ids.iter().position(|e| *e == enr.node_id()).unwrap();
-                    //     debug!("requesting sample ({i}) from {node_idx} ({node_id})");
-                    //
-                    //     let msg = sample.raw().to_vec();
-                    //     let resp = match opts.talk_wire {
-                    //         TalkWire::Discv5 => {
-                    //             match validator
-                    //                 .discv5
-                    //                 .talk_req(enr.clone(), b"sampling".to_vec(), msg)
-                    //                 .await
-                    //             {
-                    //                 Ok(b) => utils::decode_result_from_discv5(b),
-                    //                 Err(e) => Err(eyre!("error making sampling request: {e}"))
-                    //             }
-                    //         },
-                    //         TalkWire::Libp2p => {
-                    //             let (peer_id, addr) =
-                    //                 addr_book.read().await.get(&enr.node_id()).unwrap().clone();
-                    //             validator.libp2p.talk_req(&peer_id, &addr, b"sampling", msg).await
-                    //         }
-                    //     }.map_err(|e| eyre::eyre!("error requesting sample ({i}) from {node_idx} ({node_id}): {}",e));
-                    //
-                    //     if let Err(e) = resp {
-                    //         debug!("error requesting sample ({i}) from {node_idx} ({node_id}): {}",e);
-                    //     } else {
-                    //         oks += 1;
-                    //         break
-                    //     }
-                    // }
-                }
+                        if let Some(res) = futures.next().await {
+                            num_waiting -= 1;
+                            if let Some((j, sample_key, value)) = res {
+                                debug!("[validator {i} ({validator_node_id})] success requesting sample {j} ({sample_key}): value='{}'", std::str::from_utf8(&value).unwrap());
+
+                                num_success += 1;
+                            }
+                        }
+
+                        if num_waiting == 0 && samples.is_empty() {
+                            return num_success;
+                        }
+                    }
+                });
             }
 
-            let ok_queries: u32 = futures::future::join_all(futures)
+            futures::future::join_all(futures)
                 .instrument(info_span!("random-sampling"))
                 .await
                 .into_iter()
-                .map(|e| e.is_some() as u32)
-                .sum();
-
-            println!("samples found {ok_queries}/{}", args.samples_per_validator);
+                .enumerate()
+                .for_each(|(i, num_success)| {
+                    println!("validator {i}: samples found {num_success}/{}", args.samples_per_validator);
+                });
 
             let msg_count_total = {
                 let (tx, rx) = oneshot::channel();
@@ -942,7 +968,7 @@ async fn handle_dissemination_request(
         keys.push(NodeId::new(&b))
     }
 
-    // debug!("node {node_idx} ({}) receives {:?} keys for request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), keys.iter().map(|e| e.to_string()).collect::<Vec<_>>(), hex::encode(&id), from);
+    // debug!("node {node_idx} ({}) receives {:?} keys for request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), keys.iter().map(|e| e.to_string()).collect_vec(), hex::encode(&id), from);
 
     let alloc = match args.routing_strategy {
         RoutingStrategy::BucketWise => {
@@ -1084,9 +1110,9 @@ async fn handle_sampling_request(
     debug!("receive sampling request, have {} samples total, distance to requested key={:?}", samples.len(), Key::from(node.discv5.local_enr().node_id()).distance(&Key::from(key)));
 
     if let Some(_) = samples.get(&key) {
-        Ok(b"yep".to_vec())
+        Ok(b"yeh".to_vec())
     } else {
-        Err(eyre::eyre!("nope"))
+        Err(eyre::eyre!("nah"))
     }
 }
 
@@ -1100,5 +1126,20 @@ async fn _handle_sampling_request(
 
     debug!("receive sampling request, have {} samples total, distance to requested key={:?}, have requested key = {}", samples.len(), Key::from(node.discv5.local_enr().node_id()).log2_distance(&Key::from(key.clone())), samples.contains_key(key));
 
-    samples.get(key).map(|e| b"yep".to_vec())
+    samples.get(key).map(|e| b"yeh".to_vec())
+}
+
+fn get_snapshot_file<S: AsRef<str>>(opts: &Options, file: S) -> PathBuf {
+    match &*opts.snapshot {
+        "new" | "last" => {
+            let mut paths: Vec<_> = fs::read_dir(&opts.cache_dir).unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            paths.sort_by_key(|dir| dir.metadata().unwrap().created().unwrap());
+            paths.last().unwrap().path().join(file.as_ref())
+        }
+        snap => {
+            PathBuf::from(&opts.cache_dir).join(snap).join(file.as_ref())
+        }
+    }
 }
