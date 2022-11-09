@@ -1,5 +1,5 @@
-use std::iter;
 use eyre::eyre;
+use std::iter;
 use tokio::sync::oneshot;
 
 #[macro_export]
@@ -34,10 +34,13 @@ pub fn encode_result_for_discv5(r: eyre::Result<Vec<u8>>) -> Vec<u8> {
     }
 }
 
-pub fn decode_result_from_discv5(b: Vec<u8>) -> eyre::Result<Vec<u8>>{
+pub fn decode_result_from_discv5(b: Vec<u8>) -> eyre::Result<Vec<u8>> {
     match b.first().unwrap() {
         1 => Ok(b[1..b.len()].to_vec()),
-        0 => Err(eyre!("error making discv5 request: {}", std::str::from_utf8(&b[1..b.len()]).unwrap())),
+        0 => Err(eyre!(
+            "error making discv5 request: {}",
+            std::str::from_utf8(&b[1..b.len()]).unwrap()
+        )),
         _ => panic!("unexpected message encoding"),
     }
 }

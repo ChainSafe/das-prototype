@@ -16,13 +16,13 @@ use libp2p::tcp::TcpConfig;
 use libp2p::NetworkBehaviour;
 use libp2p::{identity, mplex, noise, Multiaddr, PeerId, Swarm, Transport};
 use rocket::form::FromForm;
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{io, iter};
-use std::borrow::Cow;
 use tokio::net::tcp;
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -260,10 +260,9 @@ impl Behaviour {
         resp_tx: oneshot::Sender<eyre::Result<Vec<u8>>>,
     ) {
         self.req_resp.add_address(&peer_id, addr);
-        let req_id = self.req_resp.send_request(&peer_id, TalkRequest{
-            protocol,
-            payload
-        });
+        let req_id = self
+            .req_resp
+            .send_request(&peer_id, TalkRequest { protocol, payload });
         self.pending_requests.insert(req_id, Some(resp_tx));
     }
 
@@ -365,7 +364,7 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<TalkRequest, Result<Vec<u
 #[derive(Clone, Debug)]
 pub struct TalkRequest {
     pub protocol: Vec<u8>,
-    pub payload: Vec<u8>
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -386,8 +385,8 @@ impl RequestResponseCodec for GenericCodec {
         _: &Self::Protocol,
         mut io: &mut T,
     ) -> io::Result<Self::Request>
-        where
-            T: AsyncRead + Unpin + Send,
+    where
+        T: AsyncRead + Unpin + Send,
     {
         let protocol_length = unsigned_varint::aio::read_usize(&mut io)
             .await
@@ -415,10 +414,7 @@ impl RequestResponseCodec for GenericCodec {
         let mut payload = vec![0; payload_length];
         io.read_exact(&mut payload).await?;
 
-        Ok(TalkRequest{
-            protocol,
-            payload
-        })
+        Ok(TalkRequest { protocol, payload })
     }
 
     async fn read_response<T>(
@@ -468,8 +464,11 @@ impl RequestResponseCodec for GenericCodec {
         // Write the protocol_length.
         {
             let mut buffer = unsigned_varint::encode::usize_buffer();
-            io.write_all(unsigned_varint::encode::usize(req.protocol.len(), &mut buffer))
-                .await?;
+            io.write_all(unsigned_varint::encode::usize(
+                req.protocol.len(),
+                &mut buffer,
+            ))
+            .await?;
         }
 
         // Write protocol.
@@ -478,8 +477,11 @@ impl RequestResponseCodec for GenericCodec {
         // Write the payload_length.
         {
             let mut buffer = unsigned_varint::encode::usize_buffer();
-            io.write_all(unsigned_varint::encode::usize(req.payload.len(), &mut buffer))
-                .await?;
+            io.write_all(unsigned_varint::encode::usize(
+                req.payload.len(),
+                &mut buffer,
+            ))
+            .await?;
         }
 
         // Write the payload.
