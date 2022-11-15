@@ -97,6 +97,7 @@ impl DASNode {
     ) {
         let config = OverlayConfig {
             bootnode_enrs: discovery.discv5.table_entries_enr(),
+            // todo: setting low ping interval will hurt performance, investigate the impact of not having it
             ping_queue_interval: Some(Duration::from_secs(10000)),
             query_num_results: usize::MAX,
             query_timeout: Duration::from_secs(60),
@@ -208,7 +209,6 @@ async fn app(options: Options) -> eyre::Result<()> {
         };
         let mut libp2p_msgs = UnboundedReceiverStream::new(libp2p_msgs);
         let discovery = Arc::new(Discovery::new_raw(discv5, Default::default()));
-        // let talk_req_rx = discovery.start().await.unwrap();
         let (utp_events_tx, utp_listener_tx, utp_listener_rx, mut utp_listener) =
             UtpListener::new(discovery.clone());
         tokio::spawn(async move { utp_listener.start().await });
@@ -296,26 +296,25 @@ async fn app(options: Options) -> eyre::Result<()> {
                             },
                         }
                     },
-                    // Some(crate::libp2p::TalkReqMsg{resp_tx, peer_id, payload, protocol}) = libp2p_msgs.next() => {
-                    //     debug!("Libp2p {i}: Talk request received");
-                    //     msg_counter.send(MsgCountCmd::Increment);
-                    //     let from = libp2p_to_enr.read().await.get(&peer_id).unwrap().clone();
-                    //     clone_all!(das_node, opts, enr_to_libp2p, node_ids);
-                    //     tokio::spawn(async move {
-                    //         resp_tx.send(handle_talk_request(from, &protocol, payload, das_node, opts, enr_to_libp2p, node_ids, i).await);
-                    //     });
-                    // },
+                    Some(crate::libp2p::TalkReqMsg{resp_tx, peer_id, payload, protocol}) = libp2p_msgs.next() => {
+                        debug!("Libp2p {i}: Talk request received");
+                        msg_counter.send(MsgCountCmd::Increment);
+                        let from = libp2p_to_enr.read().await.get(&peer_id).unwrap().clone();
+                        clone_all!(das_node, opts, enr_to_libp2p, node_ids);
+                        tokio::spawn(async move {
+                            resp_tx.send(handle_talk_request(from, &protocol, payload, das_node, opts, enr_to_libp2p, node_ids, i).await);
+                        });
+                    },
                     Some(command) = overlay_service.command_rx.recv() => {
                         match command {
                             OverlayCommand::Request(request) => overlay_service.process_request(request),
                             OverlayCommand::FindContentQuery { target, callback } => {
                                 if let Some(query_id) = overlay_service.init_find_content_query(target.clone(), Some(callback)) {
-                                    // debug!(
-                                    //     query.id = query_id,
-                                    //     content.id = hex_encode_compact(target.content_id()),
-                                    //     content.key = target,
-                                    //     "FindContent query initialized"
-                                    // );
+                                    debug!(
+                                        query_id=query_id.to_string(),
+                                        content_id=hex_encode_compact(target.content_id()),
+                                        "FindContent query initialized"
+                                    );
                                 }
                             }
                         }
@@ -337,7 +336,7 @@ async fn app(options: Options) -> eyre::Result<()> {
                             }
 
                         } else {
-                            // warn!(request_id: hex_encode_compact(response.request_id.to_be_bytes()), "No request found for response");
+                            warn!("No request found for response");
                         }
                     }
                     Some(Ok(node_id)) = overlay_service.peers_to_ping.next() => {
@@ -348,6 +347,7 @@ async fn app(options: Options) -> eyre::Result<()> {
                             overlay_service.peers_to_ping.insert(node_id);
                         }
                     }
+                    // todo: uncommenting next clause will servilely affect performance :/ investigate why
                     // query_event = OverlayService::<DASContentKey, XorMetric, DASValidator, MemoryContentStore>::query_event_poll(&mut overlay_service.find_node_query_pool) => {
                     //     overlay_service.handle_find_nodes_query_event(query_event);
                     // }
@@ -356,9 +356,9 @@ async fn app(options: Options) -> eyre::Result<()> {
                         overlay_service.handle_find_content_query_event(query_event);
                     }
                     _ = OverlayService::<DASContentKey, XorMetric, DASValidator, MemoryContentStore>::bucket_maintenance_poll(overlay_service.protocol.clone(), &overlay_service.kbuckets) => {}
-                    // _ = bucket_refresh_interval.tick() => {
-                    //     overlay_service.bucket_refresh_lookup();
-                    // }
+                    _ = bucket_refresh_interval.tick() => {
+                        overlay_service.bucket_refresh_lookup();
+                    }
                 }
             }
         });
@@ -375,12 +375,6 @@ async fn app(options: Options) -> eyre::Result<()> {
             msg_counter,
         )
         .await;
-
-        // let peer_count = das_nodes
-        //     .iter()
-        //     .map(|s| s.read().await.dht.connected_peers())
-        //     .collect::<Vec<_>>();
-        // println!("Peer Count: {:?}", peer_count);
     });
 
     stats_task.await.unwrap();
@@ -533,16 +527,6 @@ pub fn set_topology(opts: &Options, mut discv5_servers: Vec<Discv5>) -> Vec<Disc
             }
         }
     }
-
-    // discv5_servers.iter().enumerate().for_each(|(i,s)| {
-    //     println!("{}.id={}, i-1={:?}, n={}, known={:?}, d={:?}",
-    //              i,
-    //              s.local_enr().node_id().to_string(),
-    //              discv5_servers.get((i as i32 -1) as usize).map(|e| e.local_enr().node_id().to_string()),
-    //              s.table_entries().len(),
-    //              s.table_entries_enr().first().map(|e|e.node_id().to_string()),
-    //              Key::from(s.local_enr().node_id()).distance(&last_node_id));
-    // });
 
     discv5_servers
 }
@@ -755,6 +739,8 @@ pub async fn play_simulation(
                                         return Some((j, sample_key.clone(), b"yep".to_vec()))
                                     }
 
+                                    info!("validator {i}: looking for a sample with key {}", NodeId::new(&DASContentKey::Sample(sample_key.raw()).content_id()).to_string());
+
                                     match lookup_method {
                                         LookupMethod::Discv5FindValue => match validator.discovery.discv5.find_value(sample_key).await {
                                             Ok(res) => Some((j, sample_key.clone(), res)),
@@ -772,30 +758,27 @@ pub async fn play_simulation(
                                                     info!("missing sample is stored in {:?}, visited nodes: {:?}", local_info, search_info);
                                                     host_nodes.into_iter().for_each(|n| {
                                                         let info = nodes_by_node.get(&n).map(|x| x.into_iter().map(|e| (e.to_string(), Key::from(e.clone()).log2_distance(&Key::from(sample_key.clone())).unwrap())).sorted_by_key(|(x, y)| *y).collect_vec());
-                                                        info!("node {} that store missing samples are known by is stored in ({:?}) {:?}", n.to_string(), info.as_ref().map(|x| x.len()), info)
+                                                        info!("node {} that store missing samples are stored in ({:?}) {:?}", n.to_string(), info.as_ref().map(|x| x.len()), info)
                                                     });
                                                     None
                                                 }
                                             }
                                         }
-                                        LookupMethod::OverlayFindContent => {
-                                            info!("validator {i}: looking for a sample with key {}", NodeId::new(&DASContentKey::Sample(sample_key.raw()).content_id()).to_string());
-                                            match validator.overlay.lookup_content(DASContentKey::Sample(sample_key.raw()))
-                                                .await {
-                                                Ok(res) => Some((j, sample_key.clone(), res)),
-                                                Err(closest_nodes) => {
-                                                    error!("node {i} ({validator_node_id}) fail requesting sample {j} ({sample_key})");
+                                        LookupMethod::OverlayFindContent => match validator.overlay.lookup_content(DASContentKey::Sample(sample_key.raw()))
+                                            .await {
+                                            Ok(res) => Some((j, sample_key.clone(), res)),
+                                            Err(closest_nodes) => {
+                                                error!("node {i} ({validator_node_id}) fail requesting sample {j} ({sample_key})");
 
-                                                    let host_nodes = nodes_per_key.get(&sample_key).unwrap().clone();
-                                                    let local_info = host_nodes.iter().map(|e| (e.to_string(), XorMetric::distance(&DASContentKey::Sample(Key::from(sample_key.clone()).hash.into()).content_id(), &e.raw()).log2())).collect_vec();
-                                                    let search_info = closest_nodes.iter().map(|e| (e.to_string(), XorMetric::distance(&DASContentKey::Sample(Key::from(sample_key.clone()).hash.into()).content_id(), &e.raw()).log2().unwrap())).sorted_by_key(|(x, y)| *y).collect_vec();
-                                                    info!("missing sample is stored in {:?}, visited nodes ({}): {:?}", local_info, search_info.len(), search_info);
-                                                    host_nodes.into_iter().for_each(|n| {
-                                                        let info = nodes_by_node.get(&n).map(|x| x.into_iter().map(|e| (e.to_string(), XorMetric::distance(&DASContentKey::Sample(Key::from(sample_key.clone()).hash.into()).content_id(), &e.raw()).log2().unwrap())).sorted_by_key(|(x, y)| *y).collect_vec());
-                                                        info!("node {} that store missing samples are known by is stored in ({:?}) {:?}", n.to_string(), info.as_ref().map(|x| x.len()), info)
-                                                    });
-                                                    None
-                                                }
+                                                let host_nodes = nodes_per_key.get(&sample_key).unwrap().clone();
+                                                let local_info = host_nodes.iter().map(|e| (e.to_string(), XorMetric::distance(&DASContentKey::Sample(Key::from(sample_key.clone()).hash.into()).content_id(), &e.raw()).log2())).collect_vec();
+                                                let search_info = closest_nodes.iter().map(|e| (e.to_string(), XorMetric::distance(&DASContentKey::Sample(Key::from(sample_key.clone()).hash.into()).content_id(), &e.raw()).log2().unwrap())).sorted_by_key(|(x, y)| *y).collect_vec();
+                                                info!("missing sample is stored in {:?}, visited nodes ({}): {:?}", local_info, search_info.len(), search_info);
+                                                host_nodes.into_iter().for_each(|n| {
+                                                    let info = nodes_by_node.get(&n).map(|x| x.into_iter().map(|e| (e.to_string(), XorMetric::distance(&DASContentKey::Sample(Key::from(sample_key.clone()).hash.into()).content_id(), &e.raw()).log2().unwrap())).sorted_by_key(|(x, y)| *y).collect_vec());
+                                                    info!("node {} that store missing samples are stored in ({:?}) {:?}", n.to_string(), info.as_ref().map(|x| x.len()), info)
+                                                });
+                                                None
                                             }
                                         }
                                     }
