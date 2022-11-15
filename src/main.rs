@@ -2,16 +2,38 @@
 extern crate core;
 
 use crate::libp2p::Libp2pService;
+use crate::overlay::{DASContentKey, DASValidator};
 use crate::utils::MsgCountCmd;
+use ::libp2p::kad::store::MemoryStore;
 use ::libp2p::multiaddr::Protocol::Tcp;
 use ::libp2p::{identity, Multiaddr, PeerId};
+use args::*;
 use byteorder::{BigEndian, ReadBytesExt};
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use cli_batteries::version;
 use discv5::error::FindValueError;
 use discv5::kbucket::{BucketIndex, KBucketsTable, Node, NodeStatus};
-use discv5::{enr, enr::{CombinedKey, Enr, NodeId}, ConnectionDirection, ConnectionState, Discv5, Discv5Config, Discv5ConfigBuilder, Discv5Event, Key, RequestError, TalkRequest, kbucket};
+use discv5::{
+    enr,
+    enr::{CombinedKey, Enr, NodeId},
+    kbucket, ConnectionDirection, ConnectionState, Discv5, Discv5Config, Discv5ConfigBuilder,
+    Discv5Event, Key, RequestError, TalkRequest,
+};
+use discv5_overlay::portalnet;
+use discv5_overlay::portalnet::discovery::{Discovery, NodeAddress};
+use discv5_overlay::portalnet::overlay::{OverlayConfig, OverlayProtocol};
+use discv5_overlay::portalnet::overlay_service::{
+    OverlayCommand, OverlayRequest, OverlayRequestError, OverlayService,
+};
+use discv5_overlay::portalnet::storage::{
+    ContentStore, DistanceFunction, MemoryContentStore, PortalStorage, PortalStorageConfig,
+};
+use discv5_overlay::portalnet::types::content_key::OverlayContentKey;
+use discv5_overlay::portalnet::types::distance::{Distance, Metric, XorMetric};
+use discv5_overlay::portalnet::types::messages::ProtocolId;
+use discv5_overlay::utils::bytes::hex_encode_compact;
+use discv5_overlay::utp::stream::{UtpListener, UtpListenerRequest};
 use enr::k256::elliptic_curve::bigint::Encoding;
 use enr::k256::elliptic_curve::weierstrass::add;
 use enr::k256::U256;
@@ -19,10 +41,12 @@ use eyre::eyre;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{pin_mut, AsyncWriteExt, FutureExt};
 use itertools::Itertools;
+use lazy_static::lazy_static;
 use nanoid::nanoid;
 use rand::prelude::StdRng;
 use rand::{thread_rng, Rng, SeedableRng};
 use sha3::{Digest, Keccak256};
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::future::Future;
@@ -31,41 +55,25 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::AddAssign;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime};
 use std::{fs, iter};
-use std::borrow::Cow;
-use std::str::FromStr;
-use ::libp2p::kad::store::MemoryStore;
-use lazy_static::lazy_static;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::spawn_blocking;
 use tokio::{select, time};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tracing::{debug, info, info_span, log::warn, trace_span, Instrument};
 use tracing::log::error;
-use discv5_overlay::utils::bytes::hex_encode_compact;
-use discv5_overlay::portalnet;
-use discv5_overlay::portalnet::discovery::{Discovery, NodeAddress};
-use discv5_overlay::portalnet::overlay::{OverlayConfig, OverlayProtocol};
-use discv5_overlay::portalnet::overlay_service::{OverlayService, OverlayCommand, OverlayRequest, OverlayRequestError};
-use discv5_overlay::portalnet::storage::{ContentStore, DistanceFunction, MemoryContentStore, PortalStorage, PortalStorageConfig};
-use discv5_overlay::portalnet::types::distance::{Distance, Metric, XorMetric};
-use discv5_overlay::portalnet::types::messages::ProtocolId;
-use discv5_overlay::portalnet::types::content_key::OverlayContentKey;
-use discv5_overlay::utp::stream::{UtpListener, UtpListenerRequest};
+use tracing::{debug, info, info_span, log::warn, trace_span, Instrument};
 use warp::Filter;
-use crate::overlay::{DASContentKey, DASValidator};
-use args::*;
 
-mod libp2p;
-mod utils;
-mod overlay;
 mod args;
-
+mod libp2p;
+mod overlay;
+mod utils;
 
 const DAS_PROTOCOL_ID: &str = "DAS";
 
@@ -75,15 +83,18 @@ pub struct DASNode {
     libp2p: Libp2pService,
     samples: Arc<RwLock<HashMap<NodeId, usize>>>,
     handled_ids: Arc<RwLock<HashMap<Vec<u8>, usize>>>,
-    overlay: Arc<OverlayProtocol<DASContentKey, XorMetric, DASValidator, MemoryContentStore>>
+    overlay: Arc<OverlayProtocol<DASContentKey, XorMetric, DASValidator, MemoryContentStore>>,
 }
 
 impl DASNode {
     pub fn new(
         discovery: Arc<Discovery>,
         utp_listener_tx: mpsc::UnboundedSender<UtpListenerRequest>,
-        libp2p: Libp2pService
-    ) -> (Self, OverlayService<DASContentKey, XorMetric, DASValidator, MemoryContentStore>) {
+        libp2p: Libp2pService,
+    ) -> (
+        Self,
+        OverlayService<DASContentKey, XorMetric, DASValidator, MemoryContentStore>,
+    ) {
         let config = OverlayConfig {
             bootnode_enrs: discovery.discv5.table_entries_enr(),
             ping_queue_interval: Some(Duration::from_secs(10000)),
@@ -94,9 +105,10 @@ impl DASNode {
         };
         let protocol = ProtocolId::Custom(DAS_PROTOCOL_ID.to_string());
         let storage = {
-            Arc::new(parking_lot::RwLock::new(
-                MemoryContentStore::new(discovery.discv5.local_enr().node_id(), DistanceFunction::Xor)
-            ))
+            Arc::new(parking_lot::RwLock::new(MemoryContentStore::new(
+                discovery.discv5.local_enr().node_id(),
+                DistanceFunction::Xor,
+            )))
         };
         let validator = Arc::new(DASValidator);
 
@@ -110,13 +122,16 @@ impl DASNode {
             validator,
         );
 
-        (Self {
-            discovery,
-            libp2p,
-            samples: Default::default(),
-            handled_ids: Default::default(),
-            overlay: Arc::new(overlay),
-        }, service)
+        (
+            Self {
+                discovery,
+                libp2p,
+                samples: Default::default(),
+                handled_ids: Default::default(),
+                overlay: Arc::new(overlay),
+            },
+            service,
+        )
     }
 }
 
@@ -144,7 +159,9 @@ async fn app(options: Options) -> eyre::Result<()> {
 
     let mut das_nodes = vec![];
 
-    let enr_to_libp2p = Arc::new(RwLock::new(HashMap::<NodeId, (PeerId, Multiaddr)>::default()));
+    let enr_to_libp2p = Arc::new(RwLock::new(
+        HashMap::<NodeId, (PeerId, Multiaddr)>::default(),
+    ));
     let libp2p_to_enr = Arc::new(RwLock::new(HashMap::<PeerId, NodeId>::default()));
 
     let (msg_counter, msg_count_rx) = mpsc::unbounded_channel::<MsgCountCmd>();
@@ -200,7 +217,9 @@ async fn app(options: Options) -> eyre::Result<()> {
 
         let talk_wire = opts.talk_wire.clone();
         if talk_wire == TalkWire::Libp2p {
-            tokio::spawn(async move { libp2p_worker.run().await; });
+            tokio::spawn(async move {
+                libp2p_worker.run().await;
+            });
         }
         clone_all!(enr_to_libp2p, libp2p_to_enr, msg_counter, node_ids);
         tokio::spawn(async move {
@@ -611,29 +630,54 @@ pub async fn play_simulation(
             )
             .await;
 
-            let nodes_by_node: HashMap::<_, _> = nodes.iter().map(|e| {
-                let node_id = e.discovery.discv5.local_enr().node_id();
-                let known_by = nodes.iter().filter_map(|n| n.discovery.discv5.find_enr(&node_id).map(|x| n.discovery.discv5.local_enr().node_id())).collect_vec();
-                (node_id, known_by)
-            }).into_group_map().into_iter().map(|(n, ns)| {
-                let x = ns.into_iter().flatten().collect_vec();
-                (n, x)
-            }).collect();
+            let nodes_by_node: HashMap<_, _> = nodes
+                .iter()
+                .map(|e| {
+                    let node_id = e.discovery.discv5.local_enr().node_id();
+                    let known_by = nodes
+                        .iter()
+                        .filter_map(|n| {
+                            n.discovery
+                                .discv5
+                                .find_enr(&node_id)
+                                .map(|x| n.discovery.discv5.local_enr().node_id())
+                        })
+                        .collect_vec();
+                    (node_id, known_by)
+                })
+                .into_group_map()
+                .into_iter()
+                .map(|(n, ns)| {
+                    let x = ns.into_iter().flatten().collect_vec();
+                    (n, x)
+                })
+                .collect();
 
-            let overlay_nodes_by_node: HashMap::<_, _> = nodes.iter().map(|e| {
-                let node_id = e.discovery.discv5.local_enr().node_id();
-                let known_by = nodes.iter().filter_map(|n| {
-                    let key = kbucket::Key::from(n.discovery.discv5.local_enr().node_id());
-                    if let kbucket::Entry::Present(entry, _) = e.overlay.kbuckets.write().entry(&key) {
-                        return Some(n.discovery.discv5.local_enr().node_id())
-                    }
-                    None
-                }).collect_vec();
-                (node_id, known_by)
-            }).into_group_map().into_iter().map(|(n, ns)| {
-                let x = ns.into_iter().flatten().collect_vec();
-                (n, x)
-            }).collect();
+            let overlay_nodes_by_node: HashMap<_, _> = nodes
+                .iter()
+                .map(|e| {
+                    let node_id = e.discovery.discv5.local_enr().node_id();
+                    let known_by = nodes
+                        .iter()
+                        .filter_map(|n| {
+                            let key = kbucket::Key::from(n.discovery.discv5.local_enr().node_id());
+                            if let kbucket::Entry::Present(entry, _) =
+                                e.overlay.kbuckets.write().entry(&key)
+                            {
+                                return Some(n.discovery.discv5.local_enr().node_id());
+                            }
+                            None
+                        })
+                        .collect_vec();
+                    (node_id, known_by)
+                })
+                .into_group_map()
+                .into_iter()
+                .map(|(n, ns)| {
+                    let x = ns.into_iter().flatten().collect_vec();
+                    (n, x)
+                })
+                .collect();
 
             let mut keys_stored_total = 0usize;
             keys_per_node
@@ -688,7 +732,12 @@ pub async fn play_simulation(
                 let parallelism = args.parallelism;
                 let lookup_method = args.lookup_method.clone();
 
-                clone_all!(node_ids, nodes_per_key, nodes_by_node, overlay_nodes_by_node);
+                clone_all!(
+                    node_ids,
+                    nodes_per_key,
+                    nodes_by_node,
+                    overlay_nodes_by_node
+                );
 
                 futures.push(async move {
                     let mut futures = FuturesUnordered::new();
@@ -1191,19 +1240,18 @@ async fn handle_dissemination_request(
         if next == local_node_id {
             let mut samples = node.samples.write().await;
             let mut store = node.overlay.store.write();
-            keys.clone()
-                .into_iter()
-                .for_each(|k| {
-                    store.put(DASContentKey::Sample(k.preimage().raw()), b"yep".to_vec()).unwrap();
+            keys.clone().into_iter().for_each(|k| {
+                store
+                    .put(DASContentKey::Sample(k.preimage().raw()), b"yep".to_vec())
+                    .unwrap();
 
-                    match samples.entry(k.preimage().clone()) {
-                        Entry::Occupied(mut e) => e.get_mut().add_assign(1),
-                        Entry::Vacant(mut e) => {
-                            e.insert(1);
-                        }
+                match samples.entry(k.preimage().clone()) {
+                    Entry::Occupied(mut e) => e.get_mut().add_assign(1),
+                    Entry::Vacant(mut e) => {
+                        e.insert(1);
                     }
-                });
-
+                }
+            });
 
             continue;
         }

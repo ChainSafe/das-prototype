@@ -1,18 +1,18 @@
+use async_trait::async_trait;
+use discv5_overlay::portalnet::types::content_key::{HistoryContentKey, OverlayContentKey};
+use discv5_overlay::types::validation::Validator;
+use enr::k256::sha2::Sha256;
+use sha3::{Digest, Keccak256};
+use ssz::{Decode, Encode};
+use ssz_derive::{Decode, Encode};
 use std::fmt;
 use std::fmt::{Display, Formatter};
-use discv5_overlay::types::validation::Validator;
-use async_trait::async_trait;
-use enr::k256::sha2::Sha256;
-use ssz_derive::{Decode, Encode};
-use ssz::{Decode, Encode};
-use discv5_overlay::portalnet::types::content_key::{HistoryContentKey, OverlayContentKey};
-use sha3::{Digest, Keccak256};
 
 /// A content key in the DAS overlay network.
 #[derive(Clone, Debug, Decode, Encode, PartialEq)]
 #[ssz(enum_behaviour = "union")]
 pub enum DASContentKey {
-    Sample([u8; 32])
+    Sample([u8; 32]),
 }
 
 #[allow(clippy::from_over_into)]
@@ -31,7 +31,7 @@ impl TryFrom<Vec<u8>> for DASContentKey {
             Err(_err) => {
                 println!("unable to decode DASContentKey");
                 Err("Unable to decode SSZ")
-            },
+            }
         }
     }
 }
@@ -39,9 +39,7 @@ impl TryFrom<Vec<u8>> for DASContentKey {
 impl Display for DASContentKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            Self::Sample(b) => format!(
-                "sample: {}", hex::encode(b)
-            )
+            Self::Sample(b) => format!("sample: {}", hex::encode(b)),
         };
 
         write!(f, "{}", s)
@@ -51,7 +49,7 @@ impl Display for DASContentKey {
 impl OverlayContentKey for DASContentKey {
     fn content_id(&self) -> [u8; 32] {
         match self {
-            DASContentKey::Sample(b) => b.clone()
+            DASContentKey::Sample(b) => b.clone(),
         }
     }
 }
@@ -65,13 +63,11 @@ impl Validator<DASContentKey> for DASValidator {
         content_key: &DASContentKey,
         content: &[u8],
     ) -> anyhow::Result<()>
-        // where
+// where
         //     DASContentKey: 'async_trait,
     {
         match content_key {
-            DASContentKey::Sample(_) => {
-                Ok(())
-            }
+            DASContentKey::Sample(_) => Ok(()),
         }
     }
 }
