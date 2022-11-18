@@ -265,7 +265,10 @@ async fn app(options: Options) -> eyre::Result<()> {
                                 debug!("Stream {}: Session established {}", chan, enr);
                                 das_node.discovery.node_addr_cache
                                     .write()
-                                    .put(enr.node_id(), NodeAddress { enr, socket_addr });
+                                    .put(enr.node_id(), NodeAddress { enr: enr.clone(), socket_addr });
+
+                                let mut das_tree = das_node.das_tree.write().await;
+                                *das_tree = das_tree.add(enr).unwrap().unwrap();
                             }
                             Discv5Event::SocketUpdated(addr) => {
                                 debug!("Stream {}: Socket updated {}", chan, addr)

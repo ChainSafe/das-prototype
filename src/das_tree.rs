@@ -8,7 +8,10 @@ pub trait TreeNode<K: EnrKey + Send + Sync + Unpin + 'static>: DynClone {
     fn score(&self) -> f64;
     fn sub_tree_size(&self) -> u64;
     // Add a node to the tree, return updated tree root, and ok == true if the node didn't already exist
-    fn add(&self, n: Enr<K>) -> Result<Option<Box<dyn TreeNode<K>>>, Box<dyn std::error::Error>>;
+    fn add(
+        &self,
+        n: Enr<K>,
+    ) -> Result<Option<Box<dyn TreeNode<K> + Send + Sync>>, Box<dyn std::error::Error>>;
     // Search for closest leaf nodes (log distance) and append to out,
     // maximum to the capacity of the out slice
     fn search(&self, target: NodeId, out: Vec<Box<dyn TreeNode<K>>>) -> Vec<Box<dyn TreeNode<K>>>;
@@ -43,9 +46,9 @@ pub struct PairNode<K: EnrKey + Send + Sync + Unpin + 'static> {
     // left and right are never nil at the same time
 
     // May be nil (pair node as extension node)
-    pub left: Option<Box<dyn TreeNode<K>>>,
+    pub left: Option<Box<dyn TreeNode<K> + Send + Sync>>,
     // May be nil (pair node as extension node)
-    pub right: Option<Box<dyn TreeNode<K>>>,
+    pub right: Option<Box<dyn TreeNode<K> + Send + Sync>>,
 }
 
 impl<K: EnrKey + Send + Sync + Unpin + 'static> Clone for PairNode<K> {
@@ -81,7 +84,10 @@ where
         self.subtree_size
     }
 
-    fn add(&self, n: Enr<K>) -> Result<Option<Box<dyn TreeNode<K>>>, Box<dyn std::error::Error>> {
+    fn add(
+        &self,
+        n: Enr<K>,
+    ) -> Result<Option<Box<dyn TreeNode<K> + Send + Sync>>, Box<dyn std::error::Error>> {
         let mut pair = self.clone();
         let mut ok = false;
         if pair.id().raw() == n.node_id().raw() {
@@ -203,7 +209,10 @@ where
         1
     }
     /// add a node and returns a pair node
-    fn add(&self, n: Enr<K>) -> Result<Option<Box<dyn TreeNode<K>>>, Box<dyn std::error::Error>> {
+    fn add(
+        &self,
+        n: Enr<K>,
+    ) -> Result<Option<Box<dyn TreeNode<K> + Send + Sync>>, Box<dyn std::error::Error>> {
         if self.id().raw() == n.node_id().raw() {
             return Err("wtf".into());
         }
