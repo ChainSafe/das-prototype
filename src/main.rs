@@ -37,6 +37,7 @@ use discv5_overlay::utp::stream::{UtpListener, UtpListenerRequest};
 use enr::k256::elliptic_curve::bigint::Encoding;
 use enr::k256::elliptic_curve::weierstrass::add;
 use enr::k256::U256;
+use enr::EnrKey;
 use eyre::eyre;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{pin_mut, AsyncWriteExt, FutureExt};
@@ -51,6 +52,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::AddAssign;
 use std::path::PathBuf;
@@ -71,22 +73,39 @@ use tracing::{debug, info, info_span, log::warn, trace_span, Instrument};
 use warp::Filter;
 
 mod args;
+mod das_tree;
 mod libp2p;
 mod overlay;
 mod utils;
-
+use crate::das_tree::{LeafNode, TreeNode};
 const DAS_PROTOCOL_ID: &str = "DAS";
 
-#[derive(Clone)]
-pub struct DASNode {
+pub struct DASNode<K> {
     discovery: Arc<Discovery>,
     libp2p: Libp2pService,
     samples: Arc<RwLock<HashMap<NodeId, usize>>>,
     handled_ids: Arc<RwLock<HashMap<Vec<u8>, usize>>>,
     overlay: Arc<OverlayProtocol<DASContentKey, XorMetric, DASValidator, MemoryContentStore>>,
+    das_tree: Arc<RwLock<Box<dyn TreeNode<K> + Send + Sync>>>,
 }
 
-impl DASNode {
+impl<K: EnrKey + Send + Sync + Unpin + 'static> Clone for DASNode<K> {
+    fn clone(&self) -> Self {
+        Self {
+            discovery: self.discovery.clone(),
+            libp2p: self.libp2p.clone(),
+            samples: self.samples.clone(),
+            handled_ids: self.handled_ids.clone(),
+            overlay: self.overlay.clone(),
+            das_tree: self.das_tree.clone(),
+        }
+    }
+}
+
+impl<K: EnrKey + Send + Sync + Unpin + 'static> DASNode<K>
+where
+    LeafNode<CombinedKey>: TreeNode<K>,
+{
     pub fn new(
         discovery: Arc<Discovery>,
         utp_listener_tx: mpsc::UnboundedSender<UtpListenerRequest>,
@@ -122,7 +141,7 @@ impl DASNode {
             protocol,
             validator,
         );
-
+        let das_tree = LeafNode::new(discovery.local_enr());
         (
             Self {
                 discovery,
@@ -130,6 +149,7 @@ impl DASNode {
                 samples: Default::default(),
                 handled_ids: Default::default(),
                 overlay: Arc::new(overlay),
+                das_tree: Arc::new(RwLock::new(Box::new(das_tree))),
             },
             service,
         )
@@ -253,7 +273,8 @@ async fn app(options: Options) -> eyre::Result<()> {
                             Discv5Event::TalkRequest(req) => {
                                 debug!("Stream {}: Talk request received", chan);
                                 msg_counter.send(MsgCountCmd::Increment);
-                                clone_all!(das_node, opts, enr_to_libp2p, node_ids);
+                                let das_node = das_node.clone();
+                                clone_all!(opts, enr_to_libp2p, node_ids);
                                 tokio::spawn(async move {
                                     let protocol = ProtocolId::from_str(&hex::encode_upper(req.protocol())).unwrap();
                                     if protocol == ProtocolId::Custom(DAS_PROTOCOL_ID.to_string()) {
@@ -367,7 +388,7 @@ async fn app(options: Options) -> eyre::Result<()> {
     let stats_task = tokio::spawn(async move {
         let enrs = enrs_stats;
 
-        play_simulation(
+        play_simulation::<CombinedKey>(
             &options,
             &das_nodes,
             enr_to_libp2p.clone(),
@@ -531,9 +552,9 @@ pub fn set_topology(opts: &Options, mut discv5_servers: Vec<Discv5>) -> Vec<Disc
     discv5_servers
 }
 
-pub async fn play_simulation(
+pub async fn play_simulation<K: EnrKey + Send + Sync + Unpin + 'static>(
     opts: &Options,
-    nodes: &Vec<DASNode>,
+    nodes: &Vec<DASNode<K>>,
     addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
     node_ids: Vec<NodeId>,
     msg_counter: mpsc::UnboundedSender<MsgCountCmd>,
@@ -826,11 +847,11 @@ pub async fn play_simulation(
     }
 }
 
-pub async fn handle_talk_request(
+pub async fn handle_talk_request<K: EnrKey + Send + Sync + Unpin + 'static>(
     from: NodeId,
     protocol: &[u8],
     message: Vec<u8>,
-    node: DASNode,
+    node: DASNode<K>,
     opts: Options,
     addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
     node_ids: Vec<NodeId>,
@@ -872,11 +893,11 @@ pub async fn handle_talk_request(
     }
 }
 
-async fn disseminate_samples(
+async fn disseminate_samples<K: EnrKey + Send + Sync + Unpin + 'static>(
     keys: impl Iterator<Item = NodeId>,
     opts: &Options,
     args: &DisseminationArgs,
-    nodes: &Vec<DASNode>,
+    nodes: &Vec<DASNode<K>>,
     addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
     node_ids: &Vec<NodeId>,
 ) -> (HashMap<NodeId, usize>, HashMap<NodeId, Vec<NodeId>>) {
@@ -1075,10 +1096,10 @@ async fn disseminate_samples(
     return (keys_per_node, nodes_per_key);
 }
 
-async fn handle_dissemination_request(
+async fn handle_dissemination_request<K: EnrKey + Send + Sync + Unpin + 'static>(
     from: NodeId,
     message: Vec<u8>,
-    node: &DASNode,
+    node: &DASNode<K>,
     opts: &Options,
     args: &DisseminationArgs,
     addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>,
@@ -1298,10 +1319,10 @@ async fn handle_dissemination_request(
     Ok(vec![])
 }
 
-async fn handle_sampling_request(
+async fn handle_sampling_request<K: EnrKey + Send + Sync + Unpin + 'static>(
     _from: NodeId,
     message: Vec<u8>,
-    node: &DASNode,
+    node: &DASNode<K>,
     opts: &Options,
 ) -> eyre::Result<Vec<u8>> {
     let mut r = BufReader::new(&*message);
@@ -1329,10 +1350,10 @@ async fn handle_sampling_request(
     }
 }
 
-async fn _handle_sampling_request(
+async fn _handle_sampling_request<K: EnrKey + Send + Sync + Unpin + 'static>(
     _from: NodeId,
     key: &NodeId,
-    node: &DASNode,
+    node: &DASNode<K>,
     opts: &Options,
 ) -> Option<Vec<u8>> {
     let mut samples = node.samples.read().await;

@@ -1,7 +1,8 @@
 use discv5::enr::{Enr, NodeId};
 use dyn_clone::{clone_trait_object, DynClone};
+
 use enr::EnrKey;
-trait TreeNode<K: EnrKey + Clone>: DynClone {
+pub trait TreeNode<K: EnrKey + Send + Sync + Unpin + 'static>: DynClone {
     fn depth(&self) -> usize;
     fn id(&self) -> NodeId;
     fn score(&self) -> f64;
@@ -14,16 +15,24 @@ trait TreeNode<K: EnrKey + Clone>: DynClone {
     // Weakest finds the content with the weakest score at given tree depth
     fn weakest(&self, depth: u64) -> &dyn TreeNode<K>;
 }
-clone_trait_object!(<K:EnrKey + Clone>TreeNode<K>);
-#[derive(Clone)]
-struct LeafNode<K: EnrKey + Clone> {
+clone_trait_object!(<K:EnrKey + Send + Sync + Unpin + 'static>TreeNode<K>);
+pub struct LeafNode<K: EnrKey + Send + Sync + Unpin + 'static> {
     pub depth: usize,
     pub score: f64,
     pub _self: Enr<K>,
 }
 
-#[derive(Clone)]
-struct PairNode<K: EnrKey + Clone> {
+impl<K: EnrKey + Send + Sync + Unpin + 'static> Clone for LeafNode<K> {
+    fn clone(&self) -> Self {
+        Self {
+            depth: self.depth.clone(),
+            score: self.score.clone(),
+            _self: self._self.clone(),
+        }
+    }
+}
+
+pub struct PairNode<K: EnrKey + Send + Sync + Unpin + 'static> {
     pub depth: usize,
     pub score: f64,
     pub subtree_size: u64,
@@ -39,9 +48,22 @@ struct PairNode<K: EnrKey + Clone> {
     pub right: Option<Box<dyn TreeNode<K>>>,
 }
 
+impl<K: EnrKey + Send + Sync + Unpin + 'static> Clone for PairNode<K> {
+    fn clone(&self) -> Self {
+        Self {
+            depth: self.depth.clone(),
+            score: self.score.clone(),
+            subtree_size: self.subtree_size.clone(),
+            id: self.id.clone(),
+            left: self.left.clone(),
+            right: self.right.clone(),
+        }
+    }
+}
+
 impl<K> TreeNode<K> for PairNode<K>
 where
-    K: EnrKey + Clone,
+    K: EnrKey,
 {
     fn depth(&self) -> usize {
         self.depth
@@ -155,10 +177,18 @@ where
         self
     }
 }
-
+impl<K: EnrKey + Send + Sync + Unpin + 'static> LeafNode<K> {
+    pub fn new(enr: Enr<K>) -> Self {
+        Self {
+            depth: 0,
+            score: 0.0,
+            _self: enr,
+        }
+    }
+}
 impl<K> TreeNode<K> for LeafNode<K>
 where
-    K: EnrKey + Clone,
+    K: EnrKey,
 {
     fn depth(&self) -> usize {
         self.depth
