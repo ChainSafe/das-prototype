@@ -22,6 +22,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{io, iter};
+use std::backtrace::Backtrace;
+use std::sync::Arc;
+use std::thread::sleep;
+use discv5_overlay::portalnet::types::messages::{ByteList, ElasticPacket};
+use parking_lot::RwLock;
 use tokio::net::tcp;
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -29,6 +34,8 @@ use tokio::sync::oneshot::Sender;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tracing::{debug, info, log::warn};
+use ssz::{Encode, Decode};
+use ssz_types::VariableList;
 
 const PROTOCOL_ID: &str = "/das/0.1.0";
 
@@ -46,6 +53,9 @@ pub struct Libp2pService {
     pub(crate) local_peer_id: PeerId,
     /// Channel for sending requests to worker.
     to_worker: UnboundedSender<NetworkMessage>,
+
+    promises: Arc<RwLock<HashMap<u16, oneshot::Sender<Vec<u8>>>>>
+
 }
 
 /// Messages into the service to handle.
@@ -116,6 +126,7 @@ impl Libp2pDaemon {
         let service = Libp2pService {
             local_peer_id,
             to_worker: network_sender_in,
+            promises: Arc::new(Default::default())
         };
 
         (worker, message_chan, service)
@@ -179,6 +190,41 @@ impl Libp2pService {
         payload: Vec<u8>,
     ) -> eyre::Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
+
+        let payload = ElasticPacket::Data(ByteList::from(VariableList::from(payload.clone()))).as_ssz_bytes();
+
+        self.to_worker
+            .send(NetworkMessage::RequestResponse {
+                peer_id: peer_id.clone(),
+                addr: addr.clone(),
+                protocol: protocol.to_vec(),
+                payload,
+                resp_tx: tx,
+            })
+            .map_err(|e| eyre::eyre!("{e}"))?;
+
+        let resp: ElasticPacket = ElasticPacket::from_ssz_bytes(&*rx.await.unwrap()?).map_err(|e| eyre::eyre!("ssz decode error"))?;
+
+        match resp {
+            ElasticPacket::Data(bytes) => Ok(bytes.to_vec()),
+            ElasticPacket::Promise(promise_id) => {
+                let (tx, rx) = oneshot::channel();
+                self.promises.write().insert(promise_id, tx);
+                rx.await.map_err(|_| eyre::eyre!("promise channel was canceled"))
+            }
+            _ => panic!("unsupported response")
+        }
+    }
+
+    pub async fn send_message(
+        &self,
+        peer_id: &PeerId,
+        addr: &Multiaddr,
+        protocol: &[u8],
+        payload: Vec<u8>,
+    ) -> eyre::Result<Vec<u8>> {
+        let (tx, rx) = oneshot::channel();
+
         self.to_worker
             .send(NetworkMessage::RequestResponse {
                 peer_id: peer_id.clone(),
@@ -190,6 +236,22 @@ impl Libp2pService {
             .map_err(|e| eyre::eyre!("{e}"))?;
 
         rx.await.unwrap()
+    }
+
+    pub fn handle_promise_result(
+        &self,
+        promise_id: u16,
+        res: Vec<u8>,
+    ) {
+        let mut promises = self.promises.write();
+        match promises.remove(&promise_id) {
+            Some(tx) => tx.send(res).unwrap(),
+            None => {
+                drop(promises);
+                sleep(Duration::from_millis(1));
+                self.handle_promise_result(promise_id, res);
+            }
+        }
     }
 }
 

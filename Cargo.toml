@@ -20,6 +20,8 @@ futures = "0.3.24"
 tokio-stream = "0.1.10"
 eth2_ssz = "0.4.0"
 eth2_ssz_derive = "0.3.0"
+eth2_ssz_types = "0.2.1"
+async-recursion = "1.0.0"
 warp = "0.3"
 strum = {version = "0.24", features = ["derive"] }
 itertools = "0.10"
@@ -42,8 +44,6 @@ async-trait = "0.1.58"
 reqwest = "0.11.12"
 clap = { version = "4.0.18", features = ["derive"] }
 cli-batteries = "0.4"
-
-delay_map = "0.1.2"
 
 [build-dependencies]
 cli-batteries = "0.4"

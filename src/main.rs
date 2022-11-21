@@ -1,3 +1,4 @@
+#![feature(async_closure)]
 #[macro_use]
 extern crate core;
 
@@ -87,7 +88,6 @@ pub struct DASNode {
     samples: Arc<RwLock<HashMap<NodeId, usize>>>,
     handled_ids: Arc<RwLock<HashMap<Vec<u8>, usize>>>,
     overlay: Arc<OverlayProtocol<DASContentKey, XorMetric, DASValidator, MemoryContentStore>>,
-    active_requests: Arc<RwLock<HashMap<u16, oneshot::Sender<Vec<u8>>>>>
 }
 
 impl DASNode {
@@ -134,7 +134,6 @@ impl DASNode {
                 samples: Default::default(),
                 handled_ids: Default::default(),
                 overlay: Arc::new(overlay),
-                active_requests: Arc::new(Default::default())
             },
             service,
         )
@@ -1087,33 +1086,25 @@ fn handle_dissemination_request(
     let promise_id = utp::stream::rand();
 
     tokio::spawn(async move {
-        let message = match opts.wire_protocol {
-            TalkWire::Discv5 => {
-                let content: ElasticPacket = ElasticPacket::from_ssz_bytes(&*message).unwrap();
-                match content {
-                    ElasticPacket::Data(bytes) => bytes.to_vec(),
-                    ElasticPacket::ConnectionId(conn_id) => {
-                        let conn_id = u16::from_be(conn_id);
-                        let enr = node.discovery.find_enr_or_cache(&from).unwrap();
-                        node.overlay.init_find_content_stream(enr, conn_id).await.unwrap()
-                    }
-                    ElasticPacket::Result((promise_id, res)) => {
-                        match opts.wire_protocol {
-                            TalkWire::Discv5 => {
-                                node.overlay.handle_promise_result(promise_id, res).await
-                            },
-                            TalkWire::Libp2p => node.active_requests.write()
-                                .await
-                                .remove(&promise_id).expect("receive result for an unknown promise")
-                                .send(res).unwrap()
-                        }
-
-                        return;
-                    }
-                    _ => unreachable!()
+        let message = {
+            let content: ElasticPacket = ElasticPacket::from_ssz_bytes(&*message).unwrap();
+            match content {
+                ElasticPacket::Data(bytes) => bytes.to_vec(),
+                ElasticPacket::ConnectionId(conn_id) => {
+                    let conn_id = u16::from_be(conn_id);
+                    let enr = node.discovery.find_enr_or_cache(&from).unwrap();
+                    node.overlay.init_find_content_stream(enr, conn_id).await.unwrap()
                 }
+                ElasticPacket::Result((promise_id, res)) => {
+                    match opts.wire_protocol {
+                        TalkWire::Discv5 => node.overlay.handle_promise_result(promise_id, res),
+                        TalkWire::Libp2p => node.libp2p.handle_promise_result(promise_id, res)
+                    }
+
+                    return;
+                }
+                _ => unreachable!()
             }
-            TalkWire::Libp2p => message
         };
 
         let local_node_id = node.discovery.local_enr().node_id();
@@ -1143,8 +1134,7 @@ fn handle_dissemination_request(
                     from
                 );
 
-                let enr = node.discovery.find_enr_or_cache(&from).unwrap();
-                node.discovery.discv5.talk_req(enr, DISSEMINATION_PROTOCOL_ID.to_vec(), ElasticPacket::Result((promise_id, vec![])).as_ssz_bytes());
+                send_results(&node, &opts, &from, promise_id, vec![], addr_book).await;
                 return;
             } else {
                 debug!(
@@ -1333,11 +1323,26 @@ fn handle_dissemination_request(
             resp.unwrap();
         }
 
-        let enr = node.discovery.find_enr_or_cache(&from).unwrap();
-        node.discovery.discv5.talk_req(enr, DISSEMINATION_PROTOCOL_ID.to_vec(), ElasticPacket::Result((promise_id, vec![])).as_ssz_bytes()).await.unwrap();
+        send_results(&node, &opts, &from, promise_id, vec![], addr_book).await;
     });
 
     ElasticPacket::Promise(promise_id).as_ssz_bytes()
+}
+
+async fn send_results(node: &DASNode, opts: &Options, to: &NodeId, promise_id: u16, msg: Vec<u8>, addr_book: Arc<RwLock<HashMap<NodeId, (PeerId, Multiaddr)>>>) {
+    match opts.wire_protocol {
+        TalkWire::Discv5 => {
+            let enr = node.discovery.find_enr_or_cache(to).unwrap();
+            node.discovery.discv5.talk_req(enr, DISSEMINATION_PROTOCOL_ID.to_vec(), ElasticPacket::Result((promise_id, msg)).as_ssz_bytes()).await.unwrap();
+        }
+        TalkWire::Libp2p => {
+            let (peer_id, addr) =
+                addr_book.read().await.get(to).unwrap().clone();
+            node.libp2p
+                .send_message(&peer_id, &addr, DISSEMINATION_PROTOCOL_ID, ElasticPacket::Result((promise_id, msg)).as_ssz_bytes())
+                .await.unwrap();
+        }
+    }
 }
 
 async fn handle_sampling_request(
