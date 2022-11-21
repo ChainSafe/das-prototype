@@ -11,7 +11,7 @@ This will spin up `num-servers` of discv5 servers starting at port `start-listen
 ### Disseminate
 
 ```bash
-cargo run -- -n 500 --topology uniform disseminate -n 256 --routing-strategy 'bucket-wise' --forward-mode 'FA' --replicate-mode 'RS' --redundancy 1
+cargo run -- -n 500 --topology uniform disseminate -n 256 --batching-strategy 'bucket-wise' --forward-mode 'FA' --replicate-mode 'RS' --redundancy 1
 ```
 
 ### Sample

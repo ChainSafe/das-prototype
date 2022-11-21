@@ -49,6 +49,6 @@ cli-batteries = "0.4"
 cli-batteries = "0.4"
 
 [patch.crates-io]
-# discv5 = {git = "https://github.com/timoth-y/discv5"}
-discv5 = {path = "../discv5"}
-discv5-overlay = {path = "../trin"}
+discv5 = {git = "https://github.com/timoth-y/discv5"}
+#discv5 = {path = "../discv5"}
+#discv5-overlay = {path = "../trin"}
