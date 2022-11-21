@@ -31,8 +31,8 @@ nanoid = "0.4.0"
 chrono = "0.4.22"
 byteorder = "1.4.3"
 
-discv5-overlay = {git = "https://github.com/timoth-y/discv5-overlay" }
-# discv5-overlay = {path = "../trin"}
+# discv5-overlay = {git = "https://github.com/timoth-y/discv5-overlay" }
+discv5-overlay = {path = "../trin"}
 lazy_static = "1.4.0"
 
 libp2p = { version = "0.40.0" }
@@ -43,10 +43,12 @@ reqwest = "0.11.12"
 clap = { version = "4.0.18", features = ["derive"] }
 cli-batteries = "0.4"
 
+delay_map = "0.1.2"
+
 [build-dependencies]
 cli-batteries = "0.4"
 
 [patch.crates-io]
-discv5 = {git = "https://github.com/timoth-y/discv5"}
-#discv5 = {path = "../discv5"}
-#discv5-overlay = {path = "../trin"}
+# discv5 = {git = "https://github.com/timoth-y/discv5"}
+discv5 = {path = "../discv5"}
+discv5-overlay = {path = "../trin"}

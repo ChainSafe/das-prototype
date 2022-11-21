@@ -43,12 +43,20 @@ pub enum ReplicatePolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, EnumString)]
-pub enum RoutingStrategy {
+pub enum BatchingStrategy {
     #[strum(serialize = "b", serialize = "bucket-wise")]
     BucketWise,
     /// note: must be used with `ForwardPolicy::ForwardAll` could be a bug \_(*_*)_/
     #[strum(serialize = "d", serialize = "distance-wise")]
     DistanceWise,
+}
+
+#[derive(Clone, Debug, PartialEq, EnumString)]
+pub enum RoutingStrategy {
+    #[strum(serialize = "i", serialize = "iterative")]
+    Iterative,
+    #[strum(serialize = "r", serialize = "recursive")]
+    Recursive
 }
 
 #[derive(Clone, Debug, PartialEq, EnumString)]
@@ -69,8 +77,8 @@ pub struct Options {
     pub node_count: usize,
     #[clap(long, short, default_value = "linear")]
     pub topology: Topology,
-    #[clap(long, default_value = "discv5")]
-    pub talk_wire: TalkWire,
+    #[clap(long, short, default_value = "discv5")]
+    pub wire_protocol: TalkWire,
     #[clap(long = "timeout", default_value = "3")]
     pub request_timeout: u64,
     #[clap(long, short, default_value = "./data")]
@@ -98,7 +106,9 @@ pub struct DisseminationArgs {
     pub replicate_mode: ReplicatePolicy,
     #[clap(long, short, default_value = "1")]
     pub redundancy: usize,
-    #[clap(long, short = 's', default_value = "b")]
+    #[clap(long, short = 'b', default_value = "b")]
+    pub batching_strategy: BatchingStrategy,
+    #[clap(long, short = 's', default_value = "r")]
     pub routing_strategy: RoutingStrategy,
 }
 
