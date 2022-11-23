@@ -1057,6 +1057,7 @@ dependencies = [
  "chrono",
  "clap 4.0.18",
  "cli-batteries",
+ "delay_map",
  "discv5",
  "discv5-overlay",
  "dyn-clone",

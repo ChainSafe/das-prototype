@@ -29,6 +29,7 @@ dyn-clone = "1.0"
 rand = "0.8"
 sha3 = "0.10"
 nanoid = "0.4.0"
+delay_map = "0.1.1"
 
 chrono = "0.4.22"
 byteorder = "1.4.3"
