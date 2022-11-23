@@ -156,6 +156,31 @@ where
     }
 }
 
+// Approach: builder caches as much nodes into the tree, searches nodes for each key, and groups them somehow
+// We end up with HashMap<SampleKey, Vec<Enr>> we can control size of each enr vec by using redundansy settings
+// Cons with builder :
+// - builder won't be able to keep up with chnanges in the topology
+// - builder needs to know large number of nodes
+// - large bandwith overhead
+// 
+// Ways to overcome cons:
+// 1. continuasly do lookups in background (assumes consistent work from the builder)
+// 2. use Tree to find the closest known node then do recursive/iterative lookup to locate the "real" closest node
+//
+// Tree balancing can help tree health, can help prune or update regions of the local view so that it would be more effective for dissemination
+//
+// Metrics that might be useful to imporove efficiensy of the dissemination (e.g. speed, waht else):
+// - Time of forwarding\samples (how to measure that?)
+// - Number of peers that remote nodes knows
+// - what else?
+// 
+// That can help with improving dissemination efficiensy over time, by choosing nodes with hight score
+
+// Action items
+// - modify `search` method to consider score when ordering result or it can be done after `search`
+// - apply Tree during batching (line 938) when mapping to specific peers (idea is to use score for choosing peers)
+// - simulate case where some nodes have more contacts (ie. they are builders) and set them higher score also try do same test but without score, see the diff
+
 fn main() {
     cli_batteries::run(version!(), app);
 }
@@ -908,6 +933,9 @@ async fn disseminate_samples<K: EnrKey + Send + Sync + Unpin + 'static>(
     let local_node_id = node.discovery.discv5.local_enr().node_id();
 
     let alloc = match args.routing_strategy {
+        RoutingStrategy::TreeWise => {
+            todo!()
+        },
         RoutingStrategy::BucketWise => {
             let local_view: HashMap<_, _> = node
                 .discovery
@@ -949,7 +977,7 @@ async fn disseminate_samples<K: EnrKey + Send + Sync + Unpin + 'static>(
                         .collect::<Vec<_>>()
                 })
                 .into_group_map()
-        }
+        },
         RoutingStrategy::DistanceWise => {
             let mut local_view = node
                 .discovery
@@ -1165,6 +1193,9 @@ async fn handle_dissemination_request<K: EnrKey + Send + Sync + Unpin + 'static>
     // debug!("node {node_idx} ({}) receives {:?} keys for request (id={}) from {from_i} ({})", node.discv5.local_enr().node_id(), keys.iter().map(|e| e.to_string()).collect_vec(), hex::encode(&id), from);
 
     let alloc = match args.routing_strategy {
+        RoutingStrategy::TreeWise => {
+            todo!()
+        }
         RoutingStrategy::BucketWise => {
             let local_view: HashMap<_, _> = node
                 .discovery

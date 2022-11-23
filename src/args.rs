@@ -49,6 +49,8 @@ pub enum RoutingStrategy {
     /// note: must be used with `ForwardPolicy::ForwardAll` could be a bug \_(*_*)_/
     #[strum(serialize = "d", serialize = "distance-wise")]
     DistanceWise,
+    #[strum(serialize = "t", serialize = "tree-wise")]
+    TreeWise,
 }
 
 #[derive(Clone, Debug, PartialEq, EnumString)]
