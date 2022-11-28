@@ -110,6 +110,8 @@ pub struct DisseminationArgs {
     pub batching_strategy: BatchingStrategy,
     #[clap(long, short = 's', default_value = "r")]
     pub routing_strategy: RoutingStrategy,
+    #[clap(long, short, default_value = "15")]
+    pub parallelism: usize,
 }
 
 #[derive(Clone, Args)]

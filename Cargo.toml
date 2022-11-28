@@ -29,12 +29,12 @@ dyn-clone = "1.0"
 rand = "0.8"
 sha3 = "0.10"
 nanoid = "0.4.0"
+delay_map = "0.1.1"
 
 chrono = "0.4.22"
 byteorder = "1.4.3"
-
-# discv5-overlay = {git = "https://github.com/timoth-y/discv5-overlay" }
-discv5-overlay = {path = "../trin"}
+discv5-overlay = {git = "https://github.com/timoth-y/discv5-overlay" }
+# discv5-overlay = {path = "../trin"}
 lazy_static = "1.4.0"
 
 libp2p = { version = "0.40.0" }

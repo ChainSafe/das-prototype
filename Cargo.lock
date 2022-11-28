@@ -1057,6 +1057,7 @@ dependencies = [
  "chrono",
  "clap 4.0.18",
  "cli-batteries",
+ "delay_map",
  "discv5",
  "discv5-overlay",
  "dyn-clone",
@@ -1186,6 +1187,7 @@ dependencies = [
 [[package]]
 name = "discv5-overlay"
 version = "0.1.0"
+source = "git+https://github.com/timoth-y/discv5-overlay#50eb056713f0a223efcb24884dbda2e5dd9fcea5"
 dependencies = [
  "anyhow",
  "async-recursion",
