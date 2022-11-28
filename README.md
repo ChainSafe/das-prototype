@@ -1,6 +1,6 @@
-# DiscV5 Testing and Simulations
+# DAS prototype
 
-This repo contains code for us to get familiar with the DiscV5 libraries in hopes of using it for DA.
+This repo contains various prototypes of the core DAS components - dissemination and random sampling.
 
 ## Usage
 
