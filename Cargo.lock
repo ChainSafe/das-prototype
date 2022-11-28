@@ -1155,6 +1155,7 @@ dependencies = [
 [[package]]
 name = "discv5"
 version = "0.1.0"
+source = "git+https://github.com/timoth-y/discv5#89e7d95cae8653b827b446f57a9e98c165683e75"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1186,6 +1187,7 @@ dependencies = [
 [[package]]
 name = "discv5-overlay"
 version = "0.1.0"
+source = "git+https://github.com/timoth-y/discv5-overlay#50eb056713f0a223efcb24884dbda2e5dd9fcea5"
 dependencies = [
  "anyhow",
  "async-recursion",
