@@ -17,7 +17,7 @@ cargo run -- -n 500 --topology uniform disseminate -n 256 --batching-strategy 'b
 ### Sample
 
 ```bash
-cargo run -- -n 500 -t uniform --timeout 6 sample --validators_number 2 --samples-per-validator 75 --parallelism 30
+cargo run -- -n 500 -t uniform --timeout 6 sample --validators-number 2 --samples-per-validator 75 --parallelism 30
 ```
 
 ### Use snapshots
