@@ -718,7 +718,7 @@ pub async fn play_simulation(
                 .map(|i| (i, keys[i]))
                 .collect_vec();
 
-                let parallelism = args.parallelism;
+                let parallelism = args.dissemination_args.parallelism;
                 let lookup_method = args.lookup_method.clone();
 
                 clone_all!(

@@ -125,9 +125,6 @@ pub struct SamplingArgs {
     #[clap(long, short)]
     pub validators_number: usize,
 
-    #[clap(long, short, default_value = "15")]
-    pub parallelism: usize,
-
     #[clap(long, short, default_value = "find-value")]
     pub lookup_method: LookupMethod,
 }
